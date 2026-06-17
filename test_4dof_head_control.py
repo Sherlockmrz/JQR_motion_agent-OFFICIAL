@@ -28,17 +28,48 @@ def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
 
 
+# ========================
+# 头部 4 电机物理限位 (head_4_motor_limit.jpg)
+# ========================
+# HEAD_PITCH 头部俯仰: ±20°,  NECK_PITCH 脖子俯仰: ±27°
+# NECK_YAW   脖子摇摆: ±35°,  NECK_ROLL 头部水平(横向旋转): ±165°
+#
+# 脚本 yaw/pitch/roll 语义 → 物理轴映射（已在 s100 实测校核）:
+#   yaw  (左右转头/横向)  → NECK_ROLL  (±165°)  实测 yaw=90 单步可过
+#   roll (左右歪头/侧倾)  → NECK_YAW   (±35°)
+#   pitch(上下点头)       → HEAD_PITCH (±20°)   最受限轴；pitch=30 在多路点被拒(104)
+#
+# 多路点拟人动作的安全工作范围（留足余量，保证不被下游限位拒绝）:
+YAW_LIMIT_DEG = 90.0    # 远小于 ±165，已足够生动
+PITCH_LIMIT_DEG = 18.0  # 安全压在 ±20 之内
+ROLL_LIMIT_DEG = 30.0   # 安全压在 ±35 之内
+
+# 全局最高速度档位：用户要求所有动作一律跑最快档。
+# 接口速度档 0/1/2 = 慢/中/快；下游限位最高 80~120 deg/s。
+MAX_SPEED_LEVEL = 2
+
+
 def deg(value: float) -> float:
     return math.radians(value)
 
 
+def _clamp_axis(name: str, value: Optional[float], limit: float) -> Optional[float]:
+    """将单轴角度裁剪到安全限位内；越界时打印告警，便于发现脚本里写过头的值。"""
+    if value is None:
+        return None
+    clamped = max(-limit, min(limit, value))
+    if abs(value - clamped) > 1e-6:
+        log(f"[LIMIT] {name}={value:.1f}° 超出安全限位 ±{limit:.0f}°，已裁剪为 {clamped:.1f}°")
+    return clamped
+
+
 def speed_level_for(deg_per_sec: float) -> int:
-    """将图片中的角速度诉求映射到现有接口速度档位。"""
-    if deg_per_sec <= 30:
-        return 0
-    if deg_per_sec <= 45:
-        return 1
-    return 2
+    """将角速度诉求映射到接口速度档位。
+
+    用户要求所有动作一律跑最快档，因此无论传入多少角速度，
+    统一返回最高速度档 MAX_SPEED_LEVEL(=2)。
+    """
+    return MAX_SPEED_LEVEL
 
 
 def head_command(
@@ -77,6 +108,50 @@ def head_sequence(steps: List[Dict[str, Any]], timeout: float = 45.0) -> Dict[st
             "angle_unit": "deg",
             "timeout": timeout,
             "sequence": steps,
+        },
+    }
+
+
+def waypoint(*, yaw=None, roll=None, pitch=None, speed_level=1, timeout=10.0) -> Dict[str, Any]:
+    """构建单个路点（多路点控制用），角度单位为度，转弧度后打包。
+
+    所有角度在打包前自动裁剪到物理安全限位内（yaw±90 / pitch±18 / roll±30），
+    避免下游电机限位拒绝整条路点序列（曾出现 pitch=30 导致 REJECTED 104）。
+    速度档位：用户要求一律跑最快档，故忽略传入 speed_level，强制 MAX_SPEED_LEVEL。
+    """
+    yaw = _clamp_axis("yaw", yaw, YAW_LIMIT_DEG)
+    roll = _clamp_axis("roll", roll, ROLL_LIMIT_DEG)
+    pitch = _clamp_axis("pitch", pitch, PITCH_LIMIT_DEG)
+    return {
+        "control_yaw": yaw is not None,
+        "yaw_angle": deg(yaw) if yaw is not None else 0.0,
+        "control_roll": roll is not None,
+        "roll_angle": deg(roll) if roll is not None else 0.0,
+        "control_pitch": pitch is not None,
+        "pitch_angle": deg(pitch) if pitch is not None else 0.0,
+        "control_chassis_move": False,
+        "chassis_offset": 0.0,
+        "control_chassis_rotate": False,
+        "chassis_rotation": 0.0,
+        "speed_level": MAX_SPEED_LEVEL,
+        "timeout": float(timeout),
+    }
+
+
+def head_waypoint_sequence(waypoints: List[Dict[str, Any]], pose_mode: int = 0, timeout: float = 60.0) -> Dict[str, Any]:
+    """构建多路点头颈控制命令（使用 set_four_combine_waypoint_control）。
+
+    Args:
+        waypoints: 路点列表，每个路点包含 control_*/angle/speed_level/timeout
+        pose_mode: 0=相对位姿（缺省），1=绝对位姿
+        timeout: Agent 等待全部路点执行完成的总超时（秒）
+    """
+    return {
+        "type": "set_four_combine_waypoint_control",
+        "params": {
+            "waypoints": waypoints,
+            "pose_mode": pose_mode,
+            "timeout": timeout,
         },
     }
 
@@ -187,6 +262,185 @@ SCENARIOS = [
         ]),
     },
     {
+        "id": 10,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "好奇观察 - 发现有趣物体",
+        "description": (
+            "机器人发现地面有趣的小物体，好奇地凑近端详，边低头边左右歪头打量，最后抬头回正。\n"
+            "  动作: 低头偏左凑近 → 左歪头细看 → 右歪头换角度 → 抬头侧看 → 回正\n"
+            "  拟人化: 每个路点 pitch+yaw+roll 同时发力，模拟人凑近端详时头部的连续倾斜+转向\n"
+            "  5个路点，多轴同步"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=15, roll=10, pitch=16, speed_level=1, timeout=8.0),
+            waypoint(yaw=25, roll=25, pitch=14, speed_level=0, timeout=8.0),
+            waypoint(yaw=-25, roll=-25, pitch=16, speed_level=0, timeout=8.0),
+            waypoint(yaw=-10, roll=-15, pitch=-8, speed_level=1, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=8.0),
+        ], pose_mode=0, timeout=45.0),
+    },
+    {
+        "id": 11,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "左右观望 - 寻找用户",
+        "description": (
+            "用户呼叫后消失，机器人左右观望寻找，先快速大幅扫视，再带点抬头的细致确认。\n"
+            "  动作: 左扫抬头 → 右大幅扫视 → 回中偏左确认 → 右侧轻歪确认 → 回正\n"
+            "  拟人化: 扫视时配合抬头(pitch)与轻微歪头(roll)，模拟人四处张望的灵动感\n"
+            "  5个路点，速度有快慢变化"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=50, roll=8, pitch=-10, speed_level=2, timeout=6.0),
+            waypoint(yaw=-80, roll=-10, pitch=-8, speed_level=2, timeout=6.0),
+            waypoint(yaw=35, roll=6, pitch=-6, speed_level=1, timeout=6.0),
+            waypoint(yaw=-30, roll=-8, pitch=4, speed_level=0, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=8.0),
+        ], pose_mode=0, timeout=45.0),
+    },
+    {
+        "id": 12,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "点头认可 - 理解用户指令",
+        "description": (
+            "用户下达指令后，机器人点头表示理解和认可，点头时带一点点轻微的左右转动更自然。\n"
+            "  动作: 轻抬头 → 干脆低头 → 再抬头 → 轻点确认 → 回正\n"
+            "  拟人化: 点头(pitch)为主，叠加极小幅 yaw/roll 让动作不机械，有轻重缓急\n"
+            "  5个路点"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=4, pitch=-12, speed_level=1, timeout=5.0),
+            waypoint(yaw=-3, pitch=18, speed_level=2, timeout=5.0),
+            waypoint(yaw=4, pitch=-14, speed_level=1, timeout=5.0),
+            waypoint(yaw=-2, roll=3, pitch=12, speed_level=0, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=5.0),
+        ], pose_mode=0, timeout=35.0),
+    },
+    {
+        "id": 13,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "摇头拒绝 - 不赞同当前操作",
+        "description": (
+            "用户要求执行不安全操作，机器人干脆地摇头表示拒绝。\n"
+            "  动作: 左甩+轻低 → 右大幅甩头 → 左大幅甩头 → 右甩 → 回正\n"
+            "  拟人化: 摇头(yaw)为主，叠加极小幅 roll/pitch 让甩头有摆动惯性感，不死板\n"
+            "  5个路点，多轴同步"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=35, roll=4, pitch=4, speed_level=2, timeout=6.0),
+            waypoint(yaw=-65, roll=-6, pitch=2, speed_level=2, timeout=6.0),
+            waypoint(yaw=65, roll=6, pitch=2, speed_level=2, timeout=6.0),
+            waypoint(yaw=-35, roll=-4, pitch=3, speed_level=2, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=2, timeout=6.0),
+        ], pose_mode=0, timeout=35.0),
+    },
+    {
+        "id": 14,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "疑惑思考 - 处理复杂问题",
+        "description": (
+            "收到复杂指令，机器人做出思考状态：微微抬头偏向一侧，左右小幅摆动并轻歪头。\n"
+            "  动作: 抬头偏左歪 → 转向右上沉思 → 左上换角度想 → 轻点头(想通了) → 回正\n"
+            "  拟人化: 每步 pitch+yaw+roll 同时小幅联动，模拟人思考时头部不自觉的微动\n"
+            "  5个路点，多轴同步"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=12, roll=10, pitch=-14, speed_level=1, timeout=8.0),
+            waypoint(yaw=-30, roll=-12, pitch=-10, speed_level=1, timeout=8.0),
+            waypoint(yaw=22, roll=14, pitch=-12, speed_level=1, timeout=8.0),
+            waypoint(yaw=-8, roll=-5, pitch=10, speed_level=2, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=2, timeout=6.0),
+        ], pose_mode=0, timeout=42.0),
+    },
+    {
+        "id": 15,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "环顾四周 - 进入新环境巡视",
+        "description": (
+            "机器人进入新房间，环顾四周了解环境，视线在左右上下之间灵活游走。\n"
+            "  动作: 左转抬头看高处 → 正前上方 → 右大幅转抬头 → 右下方查看 → 回正\n"
+            "  拟人化: 大幅 yaw 扫视配合 pitch 抬头/低头与轻微 roll，模拟人巡视陌生环境\n"
+            "  5个路点，覆盖左中右+上下"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=60, roll=10, pitch=-16, speed_level=2, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=-18, speed_level=2, timeout=8.0),
+            waypoint(yaw=-80, roll=-12, pitch=-14, speed_level=2, timeout=8.0),
+            waypoint(yaw=-40, roll=-8, pitch=16, speed_level=2, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=2, timeout=8.0),
+        ], pose_mode=0, timeout=48.0),
+    },
+    {
+        "id": 16,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "惊讶反应 - 发现意外情况",
+        "description": (
+            "机器人检测到意外情况（如物体突然倒下），猛地抬头后仰并左右晃动，再缓缓回神。\n"
+            "  动作: 猛抬头后仰偏左 → 右歪急看 → 左歪再看 → 缓慢低头回正\n"
+            "  拟人化: pitch 急速抬头叠加 yaw/roll 大幅晃动，制造受惊一抖的效果，最后慢回正\n"
+            "  4个路点，前快后慢"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=12, roll=10, pitch=-18, speed_level=2, timeout=4.0),
+            waypoint(yaw=20, roll=28, pitch=-16, speed_level=2, timeout=4.0),
+            waypoint(yaw=-20, roll=-28, pitch=-14, speed_level=2, timeout=4.0),
+            waypoint(yaw=0, roll=0, pitch=8, speed_level=2, timeout=8.0),
+        ], pose_mode=0, timeout=28.0),
+    },
+    {
+        "id": 17,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "专注倾听 - 用户长篇讲述",
+        "description": (
+            "用户正在讲述，机器人保持专注倾听姿态，偶尔微调头部角度表示关注。\n"
+            "  动作: 微低头偏头凑近 → 轻左转细听 → 轻歪头点头 → 轻右转 → 回中保持\n"
+            "  拟人化: 以小幅 pitch+yaw+roll 同步微动，模拟人倾听时不自觉的偏头与点头\n"
+            "  5个路点，幅度小但有连贯生命感"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=6, roll=5, pitch=10, speed_level=1, timeout=6.0),
+            waypoint(yaw=14, roll=8, pitch=8, speed_level=1, timeout=6.0),
+            waypoint(yaw=8, roll=4, pitch=14, speed_level=1, timeout=6.0),
+            waypoint(yaw=-12, roll=-6, pitch=8, speed_level=1, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=6.0),
+        ], pose_mode=0, timeout=40.0),
+    },
+    {
+        "id": 18,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "扫描识别 - 多角度物体检测",
+        "description": (
+            "机器人对眼前物体进行多角度扫描识别，边转头边歪头变换观察角度。\n"
+            "  动作: 左侧低头歪看 → 正前俯看 → 右侧低头歪看 → 右侧平视 → 抬头回正\n"
+            "  拟人化: 每个观察角度都叠加 roll 歪头，模拟人换角度端详物体\n"
+            "  5个路点，多轴同步"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=45, roll=14, pitch=16, speed_level=1, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=18, speed_level=1, timeout=8.0),
+            waypoint(yaw=-45, roll=-14, pitch=16, speed_level=1, timeout=8.0),
+            waypoint(yaw=-45, roll=-6, pitch=0, speed_level=1, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=-8, speed_level=1, timeout=8.0),
+        ], pose_mode=0, timeout=50.0),
+    },
+    {
+        "id": 19,
+        "category": "拟人化表达 / 多路点组合",
+        "name": "打招呼 - 友好迎接用户",
+        "description": (
+            "用户走近，机器人活泼地抬头打招呼，左右轻快摆头+歪头表示友好热情。\n"
+            "  动作: 抬头扬起 → 左转右歪(俏皮) → 右转左歪(俏皮) → 轻点头致意 → 回正\n"
+            "  拟人化: 抬头同时左右摆头并反向歪头，模拟人热情打招呼的灵动\n"
+            "  5个路点，轻快速度"
+        ),
+        "command": head_waypoint_sequence([
+            waypoint(yaw=0, roll=0, pitch=-16, speed_level=2, timeout=6.0),
+            waypoint(yaw=20, roll=-12, pitch=-12, speed_level=2, timeout=6.0),
+            waypoint(yaw=-30, roll=14, pitch=-12, speed_level=2, timeout=6.0),
+            waypoint(yaw=8, roll=-4, pitch=10, speed_level=1, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=8.0),
+        ], pose_mode=0, timeout=40.0),
+    },
+    {
         "id": 90,
         "category": "辅助",
         "name": "头部电机回归0位",
@@ -272,19 +526,35 @@ def command_has_chassis_control(command: Optional[Dict[str, Any]]) -> bool:
 
 
 async def send_and_recv(websocket, command: Dict[str, Any], timeout: float = 90.0) -> Optional[Dict[str, Any]]:
-    """发送命令并等待响应。"""
+    """发送命令并等待响应。
+
+    多路点命令自动延长超时：从 params.timeout 提取 agent 超时，加 15s buffer。
+    """
+    # 如果是多路点命令，自动根据其内部 timeout 调整等待窗口
+    if command.get("type") == "set_four_combine_waypoint_control":
+        agent_timeout = command.get("params", {}).get("timeout", 60.0)
+        timeout = max(timeout, agent_timeout + 15.0)
+        log(f"  多路点命令，agent_timeout={agent_timeout:.0f}s，等待窗口={timeout:.0f}s")
+
     msg = json.dumps(command, ensure_ascii=False)
-    log(f"  发送: {msg}")
+    log(f"  发送: {msg[:200]}..." if len(msg) > 200 else f"  发送: {msg}")
     start = time.time()
-    await websocket.send(msg)
+
     try:
+        await websocket.send(msg)
+        log(f"  等待 Agent 响应（超时 {timeout:.0f}s）...")
         response = await asyncio.wait_for(websocket.recv(), timeout=timeout)
         elapsed = time.time() - start
         resp_data = json.loads(response)
-        log(f"  响应 (耗时{elapsed:.2f}s): {json.dumps(resp_data, ensure_ascii=False, indent=2)}")
+        log(f"  ← 收到响应 (耗时{elapsed:.2f}s): {json.dumps(resp_data, ensure_ascii=False, indent=2)}")
         return resp_data
     except asyncio.TimeoutError:
-        log("  ✗ 等待响应超时")
+        elapsed = time.time() - start
+        log(f"  ✗ 等待响应超时（{timeout:.0f}s，已等待{elapsed:.0f}s）")
+        return None
+    except Exception as e:
+        elapsed = time.time() - start
+        log(f"  ✗ 通信异常（{elapsed:.2f}s）: {e}")
         return None
 
 
@@ -299,7 +569,7 @@ def response_success(resp: Dict[str, Any]) -> bool:
 
 def print_scenario_menu() -> None:
     print("\n" + "=" * 80)
-    print("  4自由度头颈控制 · 场景测试（1.png/2.png/3.png，底盘不参与）")
+    print("  4自由度头颈控制 · 场景测试（含拟人化多路点组合动作）")
     print("=" * 80)
 
     current_category = None
@@ -389,11 +659,14 @@ async def main(ws_uri: str) -> None:
                     print(f"\n{'━' * 80}")
                     log(f"测试汇总: 共 {len(selected)} 个场景, 通过 {passed}, 失败 {failed}")
                     print("━" * 80)
+
+                log("关闭WebSocket连接...")
         except ConnectionRefusedError:
             log("✗ 无法连接到WebSocket服务器，请确保Agent已启动")
         except Exception as e:
             log(f"✗ 连接失败: {e}")
 
+        log("返回场景菜单")
         if choice == "0":
             break
 
@@ -411,5 +684,10 @@ if __name__ == "__main__":
     print("  1. SmartRobotAgent (WebSocket端口 8766)")
     print("  2. 四联组合电机控制下游/模拟节点 (/four_combine_motor_control_result)")
     print("  3. 本脚本只测头颈，不会下发底盘控制")
+    print()
+    print("新增功能:")
+    print("  - ID 10-19: 拟人化多路点组合动作（好奇/观望/点头/摇头/思考/环顾等）")
+    print("  - 使用 set_four_combine_waypoint_control 接口，支持 3-5 个路点序列")
+    print("  - 多轴同步控制（yaw + roll + pitch），动作更自然流畅")
     print()
     asyncio.run(main(args.ws))
