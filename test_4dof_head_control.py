@@ -29,23 +29,24 @@ def log(msg: str) -> None:
 
 
 # ========================
-# 头部 4 电机物理限位 (head_4_motor_limit.jpg)
+# 头部 4 电机物理限位 (用户权威给定)
 # ========================
-# HEAD_PITCH 头部俯仰: ±20°,  NECK_PITCH 脖子俯仰: ±27°
-# NECK_YAW   脖子摇摆: ±35°,  NECK_ROLL 头部水平(横向旋转): ±165°
+# head_pitch  头部俯仰: ±20°,  80 deg/s
+# neck_pitch  脖子俯仰: ±27°,  80 deg/s
+# neck_roll   脖子侧倾: ±35°,  80 deg/s
+# neck_yaw    脖子旋转: ±165°, 120 deg/s
 #
-# 脚本 yaw/pitch/roll 语义 → 物理轴映射（已在 s100 实测校核）:
-#   yaw  (左右转头/横向)  → NECK_ROLL  (±165°)  实测 yaw=90 单步可过
-#   roll (左右歪头/侧倾)  → NECK_YAW   (±35°)
-#   pitch(上下点头)       → HEAD_PITCH (±20°)   最受限轴；pitch=30 在多路点被拒(104)
+# 脚本 yaw/pitch/roll 语义 → 物理轴映射:
+#   yaw  (左右转头/横向)  → neck_yaw   (±165°)
+#   roll (左右歪头/侧倾)  → neck_roll  (±35°)
+#   pitch(上下点头)       → head_pitch (±20°)  ← 最受限轴，按它卡 pitch
 #
-# 多路点拟人动作的安全工作范围（留足余量，保证不被下游限位拒绝）:
-YAW_LIMIT_DEG = 90.0    # 远小于 ±165，已足够生动
-PITCH_LIMIT_DEG = 18.0  # 安全压在 ±20 之内
-ROLL_LIMIT_DEG = 30.0   # 安全压在 ±35 之内
+# 安全工作范围：严格小于边界，且至少留 5° 余量（用户要求“最少跟边界小5度”）:
+YAW_LIMIT_DEG = 160.0   # 165 - 5
+PITCH_LIMIT_DEG = 15.0  # 20 - 5  (head_pitch 最受限)
+ROLL_LIMIT_DEG = 30.0   # 35 - 5
 
 # 全局最高速度档位：用户要求所有动作一律跑最快档。
-# 接口速度档 0/1/2 = 慢/中/快；下游限位最高 80~120 deg/s。
 MAX_SPEED_LEVEL = 2
 
 
@@ -272,9 +273,9 @@ SCENARIOS = [
             "  5个路点，多轴同步"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=15, roll=10, pitch=16, speed_level=1, timeout=8.0),
-            waypoint(yaw=25, roll=25, pitch=14, speed_level=0, timeout=8.0),
-            waypoint(yaw=-25, roll=-25, pitch=16, speed_level=0, timeout=8.0),
+            waypoint(yaw=15, roll=10, pitch=14, speed_level=1, timeout=8.0),
+            waypoint(yaw=25, roll=25, pitch=13, speed_level=0, timeout=8.0),
+            waypoint(yaw=-25, roll=-25, pitch=14, speed_level=0, timeout=8.0),
             waypoint(yaw=-10, roll=-15, pitch=-8, speed_level=1, timeout=8.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=8.0),
         ], pose_mode=0, timeout=45.0),
@@ -309,7 +310,7 @@ SCENARIOS = [
         ),
         "command": head_waypoint_sequence([
             waypoint(yaw=4, pitch=-12, speed_level=1, timeout=5.0),
-            waypoint(yaw=-3, pitch=18, speed_level=2, timeout=5.0),
+            waypoint(yaw=-3, pitch=15, speed_level=2, timeout=5.0),
             waypoint(yaw=4, pitch=-14, speed_level=1, timeout=5.0),
             waypoint(yaw=-2, roll=3, pitch=12, speed_level=0, timeout=6.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=5.0),
@@ -362,10 +363,10 @@ SCENARIOS = [
             "  5个路点，覆盖左中右+上下"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=60, roll=10, pitch=-16, speed_level=2, timeout=8.0),
-            waypoint(yaw=0, roll=0, pitch=-18, speed_level=2, timeout=8.0),
+            waypoint(yaw=60, roll=10, pitch=-15, speed_level=2, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=-15, speed_level=2, timeout=8.0),
             waypoint(yaw=-80, roll=-12, pitch=-14, speed_level=2, timeout=8.0),
-            waypoint(yaw=-40, roll=-8, pitch=16, speed_level=2, timeout=8.0),
+            waypoint(yaw=-40, roll=-8, pitch=15, speed_level=2, timeout=8.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=2, timeout=8.0),
         ], pose_mode=0, timeout=48.0),
     },
@@ -380,8 +381,8 @@ SCENARIOS = [
             "  4个路点，前快后慢"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=12, roll=10, pitch=-18, speed_level=2, timeout=4.0),
-            waypoint(yaw=20, roll=28, pitch=-16, speed_level=2, timeout=4.0),
+            waypoint(yaw=12, roll=10, pitch=-15, speed_level=2, timeout=4.0),
+            waypoint(yaw=20, roll=28, pitch=-15, speed_level=2, timeout=4.0),
             waypoint(yaw=-20, roll=-28, pitch=-14, speed_level=2, timeout=4.0),
             waypoint(yaw=0, roll=0, pitch=8, speed_level=2, timeout=8.0),
         ], pose_mode=0, timeout=28.0),
@@ -415,9 +416,9 @@ SCENARIOS = [
             "  5个路点，多轴同步"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=45, roll=14, pitch=16, speed_level=1, timeout=8.0),
-            waypoint(yaw=0, roll=0, pitch=18, speed_level=1, timeout=8.0),
-            waypoint(yaw=-45, roll=-14, pitch=16, speed_level=1, timeout=8.0),
+            waypoint(yaw=45, roll=14, pitch=14, speed_level=1, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=15, speed_level=1, timeout=8.0),
+            waypoint(yaw=-45, roll=-14, pitch=14, speed_level=1, timeout=8.0),
             waypoint(yaw=-45, roll=-6, pitch=0, speed_level=1, timeout=8.0),
             waypoint(yaw=0, roll=0, pitch=-8, speed_level=1, timeout=8.0),
         ], pose_mode=0, timeout=50.0),
@@ -433,7 +434,7 @@ SCENARIOS = [
             "  5个路点，轻快速度"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=0, roll=0, pitch=-16, speed_level=2, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=-15, speed_level=2, timeout=6.0),
             waypoint(yaw=20, roll=-12, pitch=-12, speed_level=2, timeout=6.0),
             waypoint(yaw=-30, roll=14, pitch=-12, speed_level=2, timeout=6.0),
             waypoint(yaw=8, roll=-4, pitch=10, speed_level=1, timeout=6.0),
