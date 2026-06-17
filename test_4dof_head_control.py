@@ -41,10 +41,10 @@ def log(msg: str) -> None:
 #   roll (左右歪头/侧倾)  → neck_roll  (±35°)
 #   pitch(上下点头)       → head_pitch (±20°)  ← 最受限轴，按它卡 pitch
 #
-# 安全工作范围：严格小于边界，且至少留 5° 余量（用户要求“最少跟边界小5度”）:
+# 安全工作范围：严格小于边界，留足余量（pitch 重点压小，避免幅度过大）:
 YAW_LIMIT_DEG = 160.0   # 165 - 5
-PITCH_LIMIT_DEG = 15.0  # 20 - 5  (head_pitch 最受限)
-ROLL_LIMIT_DEG = 30.0   # 35 - 5
+PITCH_LIMIT_DEG = 10.0  # head_pitch ±20，压到 ±10（留 10° 余量，幅度更克制）
+ROLL_LIMIT_DEG = 25.0   # neck_roll ±35，压到 ±25（留 10° 余量）
 
 # 全局最高速度档位：用户要求所有动作一律跑最快档。
 MAX_SPEED_LEVEL = 2
@@ -273,10 +273,10 @@ SCENARIOS = [
             "  5个路点，多轴同步"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=15, roll=10, pitch=14, speed_level=1, timeout=8.0),
-            waypoint(yaw=25, roll=25, pitch=13, speed_level=0, timeout=8.0),
-            waypoint(yaw=-25, roll=-25, pitch=14, speed_level=0, timeout=8.0),
-            waypoint(yaw=-10, roll=-15, pitch=-8, speed_level=1, timeout=8.0),
+            waypoint(yaw=15, roll=10, pitch=10, speed_level=1, timeout=8.0),
+            waypoint(yaw=25, roll=24, pitch=9, speed_level=0, timeout=8.0),
+            waypoint(yaw=-25, roll=-24, pitch=10, speed_level=0, timeout=8.0),
+            waypoint(yaw=-10, roll=-15, pitch=-6, speed_level=1, timeout=8.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=8.0),
         ], pose_mode=0, timeout=45.0),
     },
@@ -309,10 +309,10 @@ SCENARIOS = [
             "  5个路点"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=4, pitch=-12, speed_level=1, timeout=5.0),
-            waypoint(yaw=-3, pitch=15, speed_level=2, timeout=5.0),
-            waypoint(yaw=4, pitch=-14, speed_level=1, timeout=5.0),
-            waypoint(yaw=-2, roll=3, pitch=12, speed_level=0, timeout=6.0),
+            waypoint(yaw=4, pitch=-9, speed_level=1, timeout=5.0),
+            waypoint(yaw=-3, pitch=10, speed_level=2, timeout=5.0),
+            waypoint(yaw=4, pitch=-10, speed_level=1, timeout=5.0),
+            waypoint(yaw=-2, roll=3, pitch=8, speed_level=0, timeout=6.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=5.0),
         ], pose_mode=0, timeout=35.0),
     },
@@ -345,10 +345,10 @@ SCENARIOS = [
             "  5个路点，多轴同步"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=12, roll=10, pitch=-14, speed_level=1, timeout=8.0),
-            waypoint(yaw=-30, roll=-12, pitch=-10, speed_level=1, timeout=8.0),
-            waypoint(yaw=22, roll=14, pitch=-12, speed_level=1, timeout=8.0),
-            waypoint(yaw=-8, roll=-5, pitch=10, speed_level=2, timeout=6.0),
+            waypoint(yaw=12, roll=10, pitch=-10, speed_level=1, timeout=8.0),
+            waypoint(yaw=-30, roll=-12, pitch=-8, speed_level=1, timeout=8.0),
+            waypoint(yaw=22, roll=14, pitch=-9, speed_level=1, timeout=8.0),
+            waypoint(yaw=-8, roll=-5, pitch=8, speed_level=2, timeout=6.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=2, timeout=6.0),
         ], pose_mode=0, timeout=42.0),
     },
@@ -363,10 +363,10 @@ SCENARIOS = [
             "  5个路点，覆盖左中右+上下"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=60, roll=10, pitch=-15, speed_level=2, timeout=8.0),
-            waypoint(yaw=0, roll=0, pitch=-15, speed_level=2, timeout=8.0),
-            waypoint(yaw=-80, roll=-12, pitch=-14, speed_level=2, timeout=8.0),
-            waypoint(yaw=-40, roll=-8, pitch=15, speed_level=2, timeout=8.0),
+            waypoint(yaw=60, roll=10, pitch=-10, speed_level=2, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=-10, speed_level=2, timeout=8.0),
+            waypoint(yaw=-80, roll=-12, pitch=-9, speed_level=2, timeout=8.0),
+            waypoint(yaw=-40, roll=-8, pitch=10, speed_level=2, timeout=8.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=2, timeout=8.0),
         ], pose_mode=0, timeout=48.0),
     },
@@ -381,10 +381,10 @@ SCENARIOS = [
             "  4个路点，前快后慢"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=12, roll=10, pitch=-15, speed_level=2, timeout=4.0),
-            waypoint(yaw=20, roll=28, pitch=-15, speed_level=2, timeout=4.0),
-            waypoint(yaw=-20, roll=-28, pitch=-14, speed_level=2, timeout=4.0),
-            waypoint(yaw=0, roll=0, pitch=8, speed_level=2, timeout=8.0),
+            waypoint(yaw=12, roll=10, pitch=-10, speed_level=2, timeout=4.0),
+            waypoint(yaw=20, roll=25, pitch=-10, speed_level=2, timeout=4.0),
+            waypoint(yaw=-20, roll=-25, pitch=-9, speed_level=2, timeout=4.0),
+            waypoint(yaw=0, roll=0, pitch=6, speed_level=2, timeout=8.0),
         ], pose_mode=0, timeout=28.0),
     },
     {
@@ -398,10 +398,10 @@ SCENARIOS = [
             "  5个路点，幅度小但有连贯生命感"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=6, roll=5, pitch=10, speed_level=1, timeout=6.0),
-            waypoint(yaw=14, roll=8, pitch=8, speed_level=1, timeout=6.0),
-            waypoint(yaw=8, roll=4, pitch=14, speed_level=1, timeout=6.0),
-            waypoint(yaw=-12, roll=-6, pitch=8, speed_level=1, timeout=6.0),
+            waypoint(yaw=6, roll=5, pitch=8, speed_level=1, timeout=6.0),
+            waypoint(yaw=14, roll=8, pitch=6, speed_level=1, timeout=6.0),
+            waypoint(yaw=8, roll=4, pitch=10, speed_level=1, timeout=6.0),
+            waypoint(yaw=-12, roll=-6, pitch=6, speed_level=1, timeout=6.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=6.0),
         ], pose_mode=0, timeout=40.0),
     },
@@ -416,11 +416,11 @@ SCENARIOS = [
             "  5个路点，多轴同步"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=45, roll=14, pitch=14, speed_level=1, timeout=8.0),
-            waypoint(yaw=0, roll=0, pitch=15, speed_level=1, timeout=8.0),
-            waypoint(yaw=-45, roll=-14, pitch=14, speed_level=1, timeout=8.0),
+            waypoint(yaw=45, roll=14, pitch=9, speed_level=1, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=10, speed_level=1, timeout=8.0),
+            waypoint(yaw=-45, roll=-14, pitch=9, speed_level=1, timeout=8.0),
             waypoint(yaw=-45, roll=-6, pitch=0, speed_level=1, timeout=8.0),
-            waypoint(yaw=0, roll=0, pitch=-8, speed_level=1, timeout=8.0),
+            waypoint(yaw=0, roll=0, pitch=-6, speed_level=1, timeout=8.0),
         ], pose_mode=0, timeout=50.0),
     },
     {
@@ -434,10 +434,10 @@ SCENARIOS = [
             "  5个路点，轻快速度"
         ),
         "command": head_waypoint_sequence([
-            waypoint(yaw=0, roll=0, pitch=-15, speed_level=2, timeout=6.0),
-            waypoint(yaw=20, roll=-12, pitch=-12, speed_level=2, timeout=6.0),
-            waypoint(yaw=-30, roll=14, pitch=-12, speed_level=2, timeout=6.0),
-            waypoint(yaw=8, roll=-4, pitch=10, speed_level=1, timeout=6.0),
+            waypoint(yaw=0, roll=0, pitch=-10, speed_level=2, timeout=6.0),
+            waypoint(yaw=20, roll=-12, pitch=-9, speed_level=2, timeout=6.0),
+            waypoint(yaw=-30, roll=14, pitch=-9, speed_level=2, timeout=6.0),
+            waypoint(yaw=8, roll=-4, pitch=8, speed_level=1, timeout=6.0),
             waypoint(yaw=0, roll=0, pitch=0, speed_level=1, timeout=8.0),
         ], pose_mode=0, timeout=40.0),
     },
@@ -585,6 +585,20 @@ def print_scenario_menu() -> None:
     print("=" * 80)
 
 
+async def return_to_zero(websocket) -> None:
+    """每个动作执行完自动回 0 位：yaw/pitch/roll 全部回正，最快档。
+
+    免去手动回正。使用单步四联控制下发 (0,0,0)。
+    """
+    log("  ↩ 自动回 0 位 ...")
+    zero_cmd = head_command(yaw=0, pitch=0, roll=0, speed_deg_s=90, timeout=15.0)
+    resp = await send_and_recv(websocket, zero_cmd, timeout=20.0)
+    if resp is not None and response_success(resp):
+        log("  ↩ 已回 0 位")
+    else:
+        log("  ↩ 回 0 位未确认成功（继续）")
+
+
 async def run_scenario(websocket, scenario: Dict[str, Any]) -> bool:
     print(f"\n{'━' * 80}")
     print(f"  场景{scenario['id']}: {scenario['name']}")
@@ -610,13 +624,18 @@ async def run_scenario(websocket, scenario: Dict[str, Any]) -> bool:
     resp = await send_and_recv(websocket, command)
     if resp is None:
         log(f"  ✗ 场景{scenario['id']}测试失败: 无响应")
-        return False
-
-    success = response_success(resp)
-    if success:
-        log(f"  ✓ 场景{scenario['id']}测试通过")
+        success = False
     else:
-        log(f"  ✗ 场景{scenario['id']}测试失败: {resp.get('error_msg', '未知错误')}")
+        success = response_success(resp)
+        if success:
+            log(f"  ✓ 场景{scenario['id']}测试通过")
+        else:
+            log(f"  ✗ 场景{scenario['id']}测试失败: {resp.get('error_msg', '未知错误')}")
+
+    # 动作执行完自动回 0 位（场景90本身就是回0位、交互场景除外）
+    if scenario.get("id") != 90 and not interactive:
+        await return_to_zero(websocket)
+
     return success
 
 
