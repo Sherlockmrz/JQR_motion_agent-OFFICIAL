@@ -616,17 +616,13 @@ class ROS2Interface:
         self.four_combine_waypoint_control_publisher = None  # 四联多路点组合电机控制发布对象
         self.cmd_vel_publisher = None  # 底盘速度控制发布对象
         self.chassis_rotate_params_publisher = None  # 底盘旋转参数设置发布对象
-        self.combine_motor_result_subscription = None  # 组合电机控制结果订阅对象
-        self.four_combine_motor_result_subscription = None  # 四联组合电机控制结果订阅对象
-        self.four_combine_waypoint_result_subscription = None  # 四联多路点组合电机控制结果订阅对象
+        self.combine_motor_result_subscription = None  # 组合电机控制结果订阅对象（唯一结果话题 /combine_motor_control_result）
         self.rgb_control_publisher = None  # RGB灯控制发布对象
         self.rgb_state_subscription = None  # RGB灯状态订阅对象
         self.rgb_monitoring_active = False  # RGB监控是否激活标志
         self.combine_motor_monitoring_active = False  # 组合电机监控是否激活标志
-        self.combine_motor_result = {}  # 组合电机执行结果 {task_id: {"progress": 0-100, "status": 101/102/103}}
-        self.four_combine_motor_monitoring_active = False  # 四联组合电机监控是否激活标志
-        self.four_combine_motor_result = {}  # 四联组合电机执行结果 {task_id: {"result": 101/102/103/104}}
-        self.four_combine_waypoint_monitoring_active = False  # 四联多路点组合电机监控是否激活标志
+        self.combine_motor_result = {}  # 组合电机执行结果 {task_id: {"result": 0-100进度 或 101/102/103/104最终}}
+        self.four_combine_motor_result = {}  # 四联组合电机(单步)执行结果 {task_id: {"result": 101/102/103/104}}
         self.four_combine_waypoint_result = {}  # 四联多路点执行结果 {task_id: {"progress": [...], "result": 101/102/103/104}}
         self._motor_task_id_counter = 0  # 组合电机任务ID计数器（float32精度安全范围：1~16777215）
         self._last_motor_task_id = 0  # 上一次生成的task_id，用于去重
@@ -1035,17 +1031,40 @@ class ROS2Interface:
         return task_id
 
     def _combine_motor_result_callback(self, msg):
-        """组合电机控制结果回调函数"""
+        """组合电机控制结果回调函数（唯一结果话题 /combine_motor_control_result）
+
+        下游 motor_controller 的所有结果（单步组合电机、多路点）都反馈到这个
+        话题，格式 [task_id, result]：result 为 0~100 表示进度，101/102/103/104
+        表示最终结果。这里统一写入三个结果字典，供各 _wait_for_* 逻辑读取。
+        """
         if not self.combine_motor_monitoring_active:
             return
         try:
             data = msg.data
-            if len(data) >= 2:
-                task_id = int(data[0])
-                result = data[1]
-                self.combine_motor_result[task_id] = {"result": result}
-                if self.four_combine_motor_monitoring_active:
-                    self.four_combine_motor_result[task_id] = {"result": result}
+            if len(data) < 2:
+                return
+            task_id = int(data[0])
+            result = data[1]
+            result_int = int(result)
+            is_final = result_int in (MotorResultCode.SUCCESS, MotorResultCode.ABORTED,
+                                      MotorResultCode.FAILED, MotorResultCode.REJECTED,
+                                      MotorResultCode.MOTOR_ERROR_ABORTED)
+
+            # 单步结果字典（_wait_for_motor_result / _wait_for_four_motor_result 读取）
+            self.combine_motor_result[task_id] = {"result": result}
+            self.four_combine_motor_result[task_id] = {"result": result}
+
+            # 多路点结果字典（_wait_for_waypoint_result 读取，区分进度/最终）
+            entry = self.four_combine_waypoint_result.setdefault(
+                task_id, {"progress": [], "result": None}
+            )
+            if is_final:
+                entry["result"] = result
+                logger.info(f"组合电机任务 {task_id} 最终结果: {result}")
+            elif 0 <= result <= 100:
+                entry["progress"].append(result)
+                logger.info(f"组合电机任务 {task_id} 进度: {result:.1f}%")
+            else:
                 logger.info(f"组合电机任务 {task_id} 结果: {result}")
         except Exception as e:
             logger.error(f"组合电机结果回调失败: {e}")
@@ -1081,113 +1100,6 @@ class ROS2Interface:
             return True
         except Exception as e:
             logger.error(f"停止组合电机监控失败: {e}")
-            return False
-
-    def _four_combine_motor_result_callback(self, msg):
-        """四联组合电机控制结果回调函数"""
-        if not self.four_combine_motor_monitoring_active:
-            return
-        try:
-            data = msg.data
-            if len(data) >= 2:
-                task_id = int(data[0])
-                result = data[1]
-                self.four_combine_motor_result[task_id] = {"result": result}
-                logger.info(f"四联组合电机任务 {task_id} 结果: {result}")
-        except Exception as e:
-            logger.error(f"四联组合电机结果回调失败: {e}")
-
-    def start_four_combine_motor_monitoring(self):
-        """启动四联组合电机控制结果监控"""
-        try:
-            if not ROS2_AVAILABLE or not self.initialized or not self.node:
-                return False
-            if self.four_combine_motor_result_subscription is None:
-                from std_msgs.msg import Float32MultiArray
-                self.four_combine_motor_result_subscription = self.node.create_subscription(
-                    Float32MultiArray,
-                    '/four_combine_motor_control_result',
-                    self._four_combine_motor_result_callback,
-                    10
-                )
-                self.four_combine_motor_monitoring_active = True
-                logger.info("四联组合电机控制结果监控已启动")
-            return True
-        except Exception as e:
-            logger.error(f"启动四联组合电机监控失败: {e}")
-            return False
-
-    def stop_four_combine_motor_monitoring(self):
-        """停止四联组合电机控制结果监控"""
-        try:
-            self.four_combine_motor_monitoring_active = False
-            if self.four_combine_motor_result_subscription:
-                self.four_combine_motor_result_subscription.destroy()
-                self.four_combine_motor_result_subscription = None
-            logger.info("四联组合电机控制结果监控已停止")
-            return True
-        except Exception as e:
-            logger.error(f"停止四联组合电机监控失败: {e}")
-            return False
-
-    def _four_combine_waypoint_result_callback(self, msg):
-        """四联多路点组合电机控制结果回调函数
-
-        反馈格式: [task_id, result]
-        result 为 101/102/103/104 表示最终结果，其它值为进度百分比(0~100)
-        """
-        if not self.four_combine_waypoint_monitoring_active:
-            return
-        try:
-            data = msg.data
-            if len(data) >= 2:
-                task_id = int(data[0])
-                result = data[1]
-                entry = self.four_combine_waypoint_result.setdefault(
-                    task_id, {"progress": [], "result": None}
-                )
-                # 判断是最终结果还是进度
-                if int(result) in (MotorResultCode.SUCCESS, MotorResultCode.ABORTED,
-                                    MotorResultCode.FAILED, MotorResultCode.REJECTED):
-                    entry["result"] = result
-                    logger.info(f"四联多路点任务 {task_id} 最终结果: {result}")
-                else:
-                    entry["progress"].append(result)
-                    logger.info(f"四联多路点任务 {task_id} 进度: {result:.1f}%")
-        except Exception as e:
-            logger.error(f"四联多路点结果回调失败: {e}")
-
-    def start_four_combine_waypoint_monitoring(self):
-        """启动四联多路点组合电机控制结果监控"""
-        try:
-            if not ROS2_AVAILABLE or not self.initialized or not self.node:
-                return False
-            if self.four_combine_waypoint_result_subscription is None:
-                from std_msgs.msg import Float32MultiArray
-                self.four_combine_waypoint_result_subscription = self.node.create_subscription(
-                    Float32MultiArray,
-                    '/four_combine_waypoint_control_result',
-                    self._four_combine_waypoint_result_callback,
-                    10
-                )
-                self.four_combine_waypoint_monitoring_active = True
-                logger.info("四联多路点组合电机控制结果监控已启动")
-            return True
-        except Exception as e:
-            logger.error(f"启动四联多路点组合电机监控失败: {e}")
-            return False
-
-    def stop_four_combine_waypoint_monitoring(self):
-        """停止四联多路点组合电机控制结果监控"""
-        try:
-            self.four_combine_waypoint_monitoring_active = False
-            if self.four_combine_waypoint_result_subscription:
-                self.four_combine_waypoint_result_subscription.destroy()
-                self.four_combine_waypoint_result_subscription = None
-            logger.info("四联多路点组合电机控制结果监控已停止")
-            return True
-        except Exception as e:
-            logger.error(f"停止四联多路点组合电机监控失败: {e}")
             return False
 
     def get_robot_state(self) -> Dict[str, Any]:
@@ -1637,10 +1549,13 @@ class ROS2Interface:
         """
         import asyncio
         start_time = time.time()
+        logger.info(f"[WAIT_MOTOR] 开始等待 task_id={task_id}，timeout={timeout}s")
+        check_count = 0
 
         while time.time() - start_time < timeout:
             if task_id in self.four_combine_motor_result:
                 result_value = int(self.four_combine_motor_result[task_id]["result"])
+                logger.info(f"[WAIT_MOTOR] task_id={task_id} 收到结果: result_value={result_value}")
                 if result_value == MotorResultCode.SUCCESS:
                     return {"success": True, "result": result_value}
                 elif result_value == MotorResultCode.FAILED:
@@ -1651,8 +1566,13 @@ class ROS2Interface:
                     return {"success": False, "result": result_value, "error_msg": "四联电机拒绝执行"}
                 elif result_value == MotorResultCode.MOTOR_ERROR_ABORTED:
                     return {"success": False, "result": result_value, "error_msg": "四联电机异常任务中止"}
+            check_count += 1
+            if check_count % 50 == 0:
+                elapsed = time.time() - start_time
+                logger.debug(f"[WAIT_MOTOR] task_id={task_id} 仍在等待，已检查{check_count}次，耗时{elapsed:.1f}s")
             await asyncio.sleep(0.1)
 
+        logger.error(f"[WAIT_MOTOR] task_id={task_id} 等待超时！entry={self.four_combine_motor_result.get(task_id)}")
         return {"success": False, "error_msg": "等待四联电机反馈超时"}
 
     async def _wait_for_waypoint_result(self, task_id: int, timeout: float = 60.0) -> Dict[str, Any]:
@@ -1668,12 +1588,15 @@ class ROS2Interface:
         """
         import asyncio
         start_time = time.time()
+        logger.info(f"[WAIT] 开始等待 task_id={task_id} 的waypoint结果，timeout={timeout}s")
+        check_count = 0
 
         while time.time() - start_time < timeout:
             entry = self.four_combine_waypoint_result.get(task_id)
             if entry and entry.get("result") is not None:
                 result_value = entry["result"]
                 progress = entry.get("progress", [])
+                logger.info(f"[WAIT] task_id={task_id} 收到结果: result_value={result_value}, progress={progress}")
                 if result_value == MotorResultCode.SUCCESS:
                     return {"success": True, "result": result_value, "progress": progress}
                 elif result_value == MotorResultCode.FAILED:
@@ -1682,8 +1605,13 @@ class ROS2Interface:
                     return {"success": False, "result": result_value, "progress": progress, "error_msg": "多路点执行中止"}
                 elif result_value == MotorResultCode.REJECTED:
                     return {"success": False, "result": result_value, "progress": progress, "error_msg": "多路点拒绝执行"}
+            check_count += 1
+            if check_count % 50 == 0:
+                elapsed = time.time() - start_time
+                logger.debug(f"[WAIT] task_id={task_id} 仍在等待，已检查{check_count}次，耗时{elapsed:.1f}s，entry={entry}")
             await asyncio.sleep(0.1)
 
+        logger.error(f"[WAIT] task_id={task_id} 等待超时！entry={self.four_combine_waypoint_result.get(task_id)}")
         return {"success": False, "error_msg": "等待多路点反馈超时"}
 
     async def _execute_four_motor_step(self, task_id: float,
@@ -4253,7 +4181,7 @@ class ROS2Interface:
             Dict[str, Any]: 控制结果 {"success": bool, "result": int, "error_msg"?: str}
         """
         try:
-            self.start_four_combine_motor_monitoring()
+            self.start_combine_motor_monitoring()
 
             task_id = self._next_motor_task_id()
             result = await self._execute_four_motor_step(
@@ -4310,25 +4238,33 @@ class ROS2Interface:
         Returns:
             Dict[str, Any]: 控制结果 {"success": bool, "result": int, "progress": [...], "task_id": int}
         """
+        logger.info(f"[WAYPOINT_CTRL] 开始 | waypoints数={len(waypoints) if waypoints else 0}, pose_mode={pose_mode}, timeout={timeout}")
         try:
             if not waypoints or len(waypoints) < 1:
                 return {"success": False, "error_msg": "路点数量必须 >= 1"}
 
-            self.start_four_combine_waypoint_monitoring()
+            logger.info(f"[WAYPOINT_CTRL] 启动 monitoring...")
+            # 多路点结果走唯一的 /combine_motor_control_result 话题
+            self.start_combine_motor_monitoring()
 
             task_id = self._next_motor_task_id()
+            logger.info(f"[WAYPOINT_CTRL] task_id={task_id}")
             # 清除旧的结果缓存
             self.four_combine_waypoint_result.pop(int(task_id), None)
 
             # 发布多路点指令
+            logger.info(f"[WAYPOINT_CTRL] 发布指令...")
             pub_result = self.publish_four_combine_waypoint_control(
                 task_id=task_id, waypoints=waypoints, pose_mode=int(pose_mode)
             )
             if not pub_result["success"]:
+                logger.error(f"[WAYPOINT_CTRL] 发布失败: {pub_result}")
                 return pub_result
 
             # 等待反馈
+            logger.info(f"[WAYPOINT_CTRL] 等待反馈 task_id={task_id}...")
             result = await self._wait_for_waypoint_result(int(task_id), timeout=float(timeout))
+            logger.info(f"[WAYPOINT_CTRL] 等待完成，result={result}")
 
             if result.get("success"):
                 logger.info(
@@ -4340,10 +4276,13 @@ class ROS2Interface:
                 logger.error(f"四联多路点控制失败: {result.get('error_msg', '未知错误')}")
 
             result["task_id"] = int(task_id)
+            logger.info(f"[WAYPOINT_CTRL] 返回 result={result}")
             return result
 
         except Exception as e:
-            logger.error(f"四联多路点控制异常: {e}")
+            logger.error(f"[WAYPOINT_CTRL] 异常: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 "success": False,
                 "error_msg": f"四联多路点控制异常: {str(e)}"
@@ -4754,20 +4693,14 @@ class SmartRobotAgent:
                 else:
                     logger.warning("机器人位置订阅启动失败")
 
-                # 启动组合电机控制结果监控
+                # 启动组合电机控制结果监控（唯一结果话题 /combine_motor_control_result，
+                # 单步与多路点结果都从这里回传）
                 combine_motor_success = self.ros2_interface.start_combine_motor_monitoring()
                 if combine_motor_success:
                     logger.info("组合电机控制结果监控已启动")
                 else:
                     logger.warning("组合电机控制结果监控启动失败")
 
-                # 启动四联组合电机控制结果监控
-                four_combine_success = self.ros2_interface.start_four_combine_motor_monitoring()
-                if four_combine_success:
-                    logger.info("四联组合电机控制结果监控已启动")
-                else:
-                    logger.warning("四联组合电机控制结果监控启动失败")
-            
             # 初始化USB串口通信
             usb_connected = await self.usb_manager.initialize()
             if not usb_connected:

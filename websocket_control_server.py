@@ -210,35 +210,40 @@ class WebSocketControlServer:
             
             # 执行任务（使用agent的execute_task方法）
             try:
+                logger.info(f"[WS] 开始执行任务 type={task_type}")
                 result = await self.agent.execute_task(task)
-                
+                logger.info(f"[WS] 任务执行返回 type={task_type}, result.success={result.get('success')}, keys={list(result.keys())}")
+
                 # 构造响应（按照协议格式）
                 response = {
                     "success": result.get("success", False),
                     "error_msg": result.get("error_msg", "") if not result.get("success") else ""
                 }
-                
+
                 # 如果有额外的数据字段，也添加到响应中
                 for key in ["result", "description", "data"]:
                     if key in result:
                         response[key] = result[key]
-                
+
                 # 保持type字段用于识别
                 response["type"] = task_type
-                
+
             except Exception as e:
-                logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 任务执行异常: {e}")
+                logger.error(f"[WS] 任务执行异常: {e}")
+                import traceback
+                traceback.print_exc()
                 response = {
                     "success": False,
                     "error_msg": f"任务执行失败: {str(e)}",
                     "type": task_type
                 }
-            
+
             # 发送响应
             elapsed = time.time() - start_time
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] [WebSocket] 任务执行完成: type={task_type}, success={response.get('success')}, 耗时={elapsed:.2f}s")
+            logger.info(f"[WS] 即将发送响应: type={task_type}, success={response.get('success')}, 耗时={elapsed:.2f}s")
             await websocket.send(json.dumps(response, ensure_ascii=False))
-            
+            logger.info(f"[WS] 响应已发送")
+
         except Exception as e:
             logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 处理消息失败: {e}")
             self.total_errors += 1
