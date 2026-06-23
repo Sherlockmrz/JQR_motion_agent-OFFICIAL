@@ -15,6 +15,11 @@ import re
 import queue
 from enum import IntEnum
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 # 导入USB串口管理器（可选）
 try:
     from usb_serial_manager import SerialManager
@@ -4628,6 +4633,11 @@ class SmartRobotAgent:
         self.local_model_websocket = None
         self.local_model_connected = False
         self.local_model_uri = config.LOCAL_MODEL_URI
+        self.llm_backend = config.LLM_BACKEND.strip().lower()
+        self.openai_api_key = config.OPENAI_API_KEY
+        self.openai_base_url = config.OPENAI_BASE_URL
+        self.openai_model = config.OPENAI_MODEL
+        self.openai_client = None
         # 任务执行状态跟踪
         self.active_navigation_tasks = set()  # 正在执行的导航任务ID集合
         self.task_execution_lock = asyncio.Lock()  # 任务执行锁
@@ -4917,7 +4927,7 @@ class SmartRobotAgent:
         
         # 解析LLM响应
         try:
-            task_data = json.loads(llm_response)
+            task_data = self._parse_llm_json(llm_response)
             result_type = task_data.get("type", "")
             result_params = task_data.get("params", {})
 
@@ -5059,6 +5069,52 @@ Agent已知的能力（可用工具）:
 
         return system_prompt
 
+    def _use_openai_compatible_backend(self) -> bool:
+        return self.llm_backend == "openai_compatible"
+
+    def _ensure_openai_client(self) -> None:
+        if self.openai_client is not None:
+            return
+        if OpenAI is None:
+            raise RuntimeError(
+                "openai package is not installed. Please install dependencies first."
+            )
+        self.openai_client = OpenAI(
+            api_key=self.openai_api_key,
+            base_url=self.openai_base_url,
+        )
+
+    async def _call_openai_compatible_llm(self, messages: List[Dict[str, Any]]) -> str:
+        self._ensure_openai_client()
+        completion = await asyncio.to_thread(
+            self.openai_client.chat.completions.create,
+            model=self.openai_model,
+            messages=messages,
+        )
+        return completion.choices[0].message.content or ""
+
+    def _parse_llm_json(self, llm_response: str) -> Any:
+        try:
+            return json.loads(llm_response)
+        except json.JSONDecodeError:
+            pass
+
+        fenced = re.search(
+            r"```(?:json)?\s*([\s\S]*?)\s*```",
+            llm_response,
+            flags=re.IGNORECASE,
+        )
+        if fenced:
+            return json.loads(fenced.group(1))
+
+        for start_char, end_char in (("{", "}"), ("[", "]")):
+            start = llm_response.find(start_char)
+            end = llm_response.rfind(end_char)
+            if start != -1 and end > start:
+                return json.loads(llm_response[start:end + 1])
+
+        return json.loads(llm_response)
+
     async def _call_llm_for_analysis(self, prompt: str) -> str:
         """调用LLM进行任务分析
 
@@ -5069,6 +5125,21 @@ Agent已知的能力（可用工具）:
             str: LLM的JSON格式响应
         """
         try:
+            if self._use_openai_compatible_backend():
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a robot task planning assistant. "
+                            "Return strict JSON only."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ]
+                return await self._call_openai_compatible_llm(messages)
             # 构造LLM请求格式 - 按照本地模型期望的messages数组格式
             messages = [
                 {
@@ -5155,16 +5226,17 @@ Agent已知的能力（可用工具）:
             ]
 
             # 使用 OpenAI 客户端调用本地模型
-            completion = self.openai_client.chat.completions.create(
-                model=self.openai_model,
-                messages=messages,
-            )
-            llm_response = completion.choices[0].message.content
+            if self._use_openai_compatible_backend():
+                llm_response = await self._call_openai_compatible_llm(messages)
+            else:
+                llm_response = await self._call_llm_for_analysis(
+                    f"{system_prompt}\n\n鐢ㄦ埛鎸囦护: {user_prompt}"
+                )
 
             logger.info(f"LLM响应: {llm_response}")
 
             # 解析LLM响应
-            task_data = json.loads(llm_response)
+            task_data = self._parse_llm_json(llm_response)
 
             # 检查返回格式
             if isinstance(task_data, list):
