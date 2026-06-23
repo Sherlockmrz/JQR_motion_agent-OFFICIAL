@@ -5799,16 +5799,21 @@ Agent已知的能力（可用工具）:
             result_msg = {
                         "type": "go_find_person",
                         "success": False,
-                        "err_msg": ""}
+                        "err_msg": "",
+                        "distance":-99
+                        }
             response = await self.send_to_local_model(model_data)
             if response and response.get("error_msg") == "无法连接到本地模型服务器":
                 result_msg = {
                         "type": "go_find_person",
                         "success": False,
-                        "err_msg": "无法连接到本地模型服务器"}
+                        "err_msg": "无法连接到本地模型服务器",
+                        "distance": -99
+                        }
                 return result_msg
             result_msg["success"] = response.get("success", False)
             result_msg["err_msg"] = response.get("error_msg", "")
+            result_msg["distance"] = response.get("distance", -99)
             return result_msg
 
         except Exception as e:
@@ -5816,7 +5821,8 @@ Agent已知的能力（可用工具）:
             result_msg = {
                 "type": "go_find_person",
                 "success": False,
-                "error_msg": str(e)
+                "error_msg": str(e),
+                "distance":-99
             }
             return result_msg
 
