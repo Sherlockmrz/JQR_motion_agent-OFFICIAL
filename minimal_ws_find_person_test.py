@@ -17,7 +17,7 @@ async def main() -> None:
     parser.add_argument("--prompt", default=None)
     parser.add_argument(
         "--task",
-        default="find_person",
+        default="go_find_person",
         choices=["find_person", "go_find_person"],
         help="find_person is a static lookup; go_find_person may trigger navigation.",
     )
