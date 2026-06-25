@@ -4638,6 +4638,12 @@ class SmartRobotAgent:
         self.openai_base_url = config.OPENAI_BASE_URL
         self.openai_model = config.OPENAI_MODEL
         self.openai_client = None
+        logger.info(
+            "LLM backend resolved: backend=%s base_url=%s model=%s",
+            self.llm_backend,
+            self.openai_base_url,
+            self.openai_model,
+        )
         # 任务执行状态跟踪
         self.active_navigation_tasks = set()  # 正在执行的导航任务ID集合
         self.task_execution_lock = asyncio.Lock()  # 任务执行锁
@@ -5079,6 +5085,10 @@ Agent已知的能力（可用工具）:
             raise RuntimeError(
                 "openai package is not installed. Please install dependencies first."
             )
+        if not self.openai_api_key or self.openai_api_key == "0":
+            raise RuntimeError(
+                "OPENAI_API_KEY is missing. Please set it in .env before using the openai_compatible backend."
+            )
         self.openai_client = OpenAI(
             api_key=self.openai_api_key,
             base_url=self.openai_base_url,
@@ -5086,12 +5096,22 @@ Agent已知的能力（可用工具）:
 
     async def _call_openai_compatible_llm(self, messages: List[Dict[str, Any]]) -> str:
         self._ensure_openai_client()
-        completion = await asyncio.to_thread(
-            self.openai_client.chat.completions.create,
-            model=self.openai_model,
-            messages=messages,
-        )
-        return completion.choices[0].message.content or ""
+        try:
+            completion = await asyncio.to_thread(
+                self.openai_client.chat.completions.create,
+                model=self.openai_model,
+                messages=messages,
+            )
+            return completion.choices[0].message.content or ""
+        except Exception as exc:
+            logger.error(
+                "OpenAI-compatible call failed: base_url=%s model=%s error=%s",
+                self.openai_base_url,
+                self.openai_model,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     def _parse_llm_json(self, llm_response: str) -> Any:
         try:

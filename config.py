@@ -1,21 +1,35 @@
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 
 
 def _load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
+    candidates = []
+    cwd_path = Path(path)
+    module_path = Path(__file__).resolve().parent / path
 
-    with open(path, "r", encoding="utf-8") as env_file:
-        for raw_line in env_file:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    for candidate in (module_path, cwd_path):
+        if candidate.exists() and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        with candidate.open("r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 _load_dotenv()
+
+
+def _default_openai_base_url() -> str:
+    backend = os.getenv("LLM_BACKEND", "local_ws").strip().lower()
+    if backend == "openai_compatible":
+        return "https://openrouter.ai/api/v1"
+    return "http://192.168.31.43:9000/v1"
 
 
 @dataclass
@@ -40,7 +54,7 @@ class AgentConfig:
     )
     OPENAI_BASE_URL: str = field(
         default_factory=lambda: os.getenv(
-            "OPENAI_BASE_URL", "http://192.168.31.43:9000/v1"
+            "OPENAI_BASE_URL", _default_openai_base_url()
         )
     )
     OPENAI_MODEL: str = field(
