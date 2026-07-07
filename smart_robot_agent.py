@@ -30,7 +30,7 @@ except ImportError:
     logging.getLogger(__name__).info("usb_serial_manager不可用，串口功能已禁用")
 
 # 导入WebSocket控制服务器
-from websocket_control_server import WebSocketControlServer
+from websocket_control_server import WebSocketControlServer, install_trace_logging
 
 # 导入配置
 from config import config
@@ -95,6 +95,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# ============ 统一日志格式：[trace=..][时间][标签] 内容（1:1 保留每行，去掉 INFO-名字）============
+install_trace_logging()
 
 # ROS2 可用性标志
 ROS2_AVAILABLE = False
@@ -2897,7 +2900,8 @@ class ROS2Interface:
         """
         if self.last_position:
             self.pre_position = self.last_position
-            logger.info(f"已记录当前位置: {self.pre_position['position']}")
+            _pos = self.pre_position.get('position', {}) if isinstance(self.pre_position, dict) else {}
+            logger.info(f"已记录出发位置 x={_pos.get('x', 0):.2f}, y={_pos.get('y', 0):.2f}, z={_pos.get('z', 0):.2f}（作为起点）")
             return True
         else:
             logger.warning("没有可用的位置信息")
@@ -4929,7 +4933,7 @@ class SmartRobotAgent:
         
         # 调用LLM
         llm_response = await self._call_llm_for_analysis(full_prompt)
-        logger.info(f"LLM响应: {llm_response}")
+        logger.info(f"LLM 兜底回复：{llm_response.get('params', {}).get('response', '')}" if isinstance(llm_response, dict) and llm_response.get("type") == "default" else f"LLM 响应：{llm_response}")
         
         # 解析LLM响应
         try:
@@ -5192,7 +5196,7 @@ Agent已知的能力（可用工具）:
             elif isinstance(response, str):
                 return response
             else:
-                logger.warning(f"LLM响应格式异常: {response}")
+                logger.warning(f"LLM 响应异常：{response.get('error_msg') if isinstance(response, dict) and response.get('error_msg') else response}")
                 # 返回默认的default
                 return json.dumps({"type": "default", "params": {"response": "抱歉，我无法理解您的指令"}})
                 
@@ -5232,7 +5236,7 @@ Agent已知的能力（可用工具）:
 """
 
         try:
-            logger.info(f"开始任务拆解: {user_prompt}")
+            logger.info(f"正在做任务拆解：{user_prompt}")
 
             # 构造消息数组格式（使用 OpenAI 兼容格式）
             messages = [
@@ -5254,7 +5258,7 @@ Agent已知的能力（可用工具）:
                     f"{system_prompt}\n\n鐢ㄦ埛鎸囦护: {user_prompt}"
                 )
 
-            logger.info(f"LLM响应: {llm_response}")
+            logger.info(f"LLM 兜底回复：{llm_response.get('params', {}).get('response', '')}" if isinstance(llm_response, dict) and llm_response.get("type") == "default" else f"LLM 响应：{llm_response}")
 
             # 解析LLM响应
             task_data = self._parse_llm_json(llm_response)
@@ -5684,7 +5688,7 @@ Agent已知的能力（可用工具）:
                     "object_description": row[6]
                 }
             else:
-                logger.info(f"Object {obj_name} not found in database")
+                logger.info(f'数据库里没有"{obj_name}"（未录入）')
         except sqlite3.Error as e:
             logger.error(f"[ERROR] DB query failed: {e}")
         return None
@@ -5699,7 +5703,7 @@ Agent已知的能力（可用工具）:
         Returns:
             Dict[str, Any]: 工具执行结果
         """
-        logger.info(f"开始查找物品/人员: {obj_name}, 用户指令: {user_prompt}")
+        logger.info(f"开始查找：{obj_name}（用户指令：{user_prompt}）")
 
         # 存储初始查询结果
         initial_find_result = None
@@ -5743,16 +5747,16 @@ Agent已知的能力（可用工具）:
             # Step 3: 先发送找物结果给客户端
             if initial_find_result:
                 await self.send_response_to_client(initial_find_result)
-                logger.info("已发送找物结果给客户端")
+                logger.info('已把"未找到"的初步结果回给客户端')
 
             # Step 4: 使用LLM对user_prompt进行任务拆解并执行
             if user_prompt:
-                logger.info(f"开始对用户指令进行任务拆解: {user_prompt}")
+                logger.info(f"因带用户指令，开始用 LLM 拆解任务：{user_prompt}")
                 task_list = await self._decompose_find_object_task(user_prompt)
                 success_count = 0
                 response = {}
                 if task_list and len(task_list) > 0:
-                    logger.info(f"LLM拆解出 {len(task_list)} 个子任务，开始执行")
+                    logger.info(f"LLM 拆出 {len(task_list)} 个子任务，开始执行")
                     # 依次执行所有go_to_object任务
                     for task in task_list:
                         if task.get("type") == "go_to_object":
@@ -5769,7 +5773,7 @@ Agent已知的能力（可用工具）:
                             initial_find_result["position_description"] = response.get("error_msg", "")
                         logger.info("所有找物子任务执行成功")
                     else:
-                        logger.info(f"找物子任务执行完成，成功 {success_count} 个，失败 {len(task_list) - success_count} 个")
+                        logger.info(f"子任务执行完成：成功 {success_count} 个、失败 {len(task_list) - success_count} 个")
                 else:
                     logger.info("LLM未拆解出子任务")
 
@@ -6249,7 +6253,11 @@ Agent已知的能力（可用工具）:
                     )
                     logger.info(f"成功建立线程本地连接: {self.local_model_uri}")
                 except Exception as e:
-                    logger.error(f"创建线程本地连接失败: {e}")
+                    _uri = getattr(self, "local_model_uri", "")
+                    _hp = _uri.split("://", 1)[-1].split("/", 1)[0] if _uri else "本地模型服务"
+                    _eno = getattr(e, "errno", None)
+                    _desc = f"Errno {_eno}，连接被拒" if _eno == 111 else (f"Errno {_eno}" if _eno else str(e))
+                    logger.error(f"连接本地模型服务 {_hp} 失败（{_desc}）")
                     return {"success": False, "error_msg": f"无法连接到本地模型服务器: {str(e)}"}
 
             websocket = thread_local.websocket

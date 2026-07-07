@@ -11,6 +11,54 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+# ============ 统一日志格式支撑：[trace=..][时间][标签] 内容 ============
+# 当前任务上下文（机器人单任务串行，用全局即可）。WS 入口在连接/收命令时更新它，
+# filter 会把 trace/label 注入到每一条日志记录里，从而所有模块的日志都带同样前缀。
+class _LogContext:
+    trace = "-"
+    label = "系统"
+
+
+log_context = _LogContext()
+
+
+class _TraceFilter(logging.Filter):
+    def filter(self, record):
+        record.trace = getattr(log_context, "trace", "-")
+        record.label = getattr(log_context, "label", "系统")
+        return True
+
+
+def install_trace_logging():
+    """把 root 上的 handler 换成 [trace=..][时间][标签] 格式并注入 trace/label。
+    在 smart_robot_agent 的 basicConfig 之后调用一次，对所有模块日志生效（1:1 保留每行）。"""
+    fmt = logging.Formatter(
+        "[trace=%(trace)s][%(asctime)s.%(msecs)03d][%(label)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers:
+        h.setFormatter(fmt)
+        h.addFilter(_TraceFilter())
+    # websockets 库的 INFO（connection open / server listening）不需要，降到 WARNING
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+# type -> 中文任务标签
+TYPE_LABEL = {
+    "find_person": "找人",
+    "go_find_person": "找人",
+    "find_object": "找物",
+    "go_to_object": "找物",
+    "follow_person": "跟随",
+}
+
+
+def _make_trace() -> str:
+    """任务追踪号：连接建立时刻，格式 YYYYMMDD-HHMMSS。"""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
 
 class WebSocketControlServer:
     """WebSocket控制服务器
@@ -54,10 +102,10 @@ class WebSocketControlServer:
         """
         try:
             if self.running:
-                logger.warning(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket控制服务器已在运行")
+                logger.warning(f"WebSocket控制服务器已在运行")
                 return True
             
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 正在启动WebSocket控制服务器 ws://{self.host}:{self.port}")
+            logger.info(f"正在启动WebSocket控制服务器 ws://{self.host}:{self.port}")
             
             # 创建新的事件循环和线程
             self.running = True
@@ -71,11 +119,11 @@ class WebSocketControlServer:
             # 等待服务器启动
             time.sleep(0.5)
             
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket控制服务器已启动，监听端口: {self.port}")
+            logger.info(f"WebSocket控制服务器已启动，监听端口: {self.port}")
             return True
             
         except Exception as e:
-            logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 启动WebSocket控制服务器失败: {e}")
+            logger.error(f"启动WebSocket控制服务器失败: {e}")
             self.running = False
             return False
     
@@ -97,14 +145,14 @@ class WebSocketControlServer:
                     ping_timeout=None    # 禁用 ping timeout
                 ):
                     self.server = True  # 标记服务器已启动
-                    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket服务器正在监听 {self.host}:{self.port}")
+                    logger.info(f"WebSocket服务器正在监听 {self.host}:{self.port}")
                     # 保持运行
                     await asyncio.Future()  # 永久等待
             
             loop.run_until_complete(run_server())
             
         except Exception as e:
-            logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket服务器运行异常: {e}")
+            logger.error(f"WebSocket服务器运行异常: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -117,7 +165,12 @@ class WebSocketControlServer:
             websocket: WebSocket连接对象
         """
         client_addr = websocket.remote_address
-        logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 新的WebSocket客户端连接: {client_addr}")
+        _ip = f"{client_addr[0]}:{client_addr[1]}" if client_addr else "未知"
+        # 新会话：设置 trace 上下文（命令到达前标签为“连接”）
+        log_context.trace = _make_trace()
+        log_context.label = "连接"
+        logger.info("WebSocket 连接已打开，等待上层任务")
+        logger.info(f"新客户端接入：{_ip}，Agent 已就绪可接收任务")
         
         # 添加到连接列表
         with self.clients_lock:
@@ -129,7 +182,7 @@ class WebSocketControlServer:
                 try:
                     await self._handle_message(websocket, message)
                 except Exception as e:
-                    logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 处理消息异常: {e}")
+                    logger.error(f"处理消息异常: {e}")
                     self.total_errors += 1
                     # 发送错误响应
                     error_response = {
@@ -139,9 +192,9 @@ class WebSocketControlServer:
                     await websocket.send(json.dumps(error_response, ensure_ascii=False))
         
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket客户端断开连接: {client_addr}")
+            logger.info(f"客户端 {_ip} 已断开连接，本次会话结束")
         except Exception as e:
-            logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket连接异常: {e}")
+            logger.error(f"WebSocket连接异常: {e}")
         finally:
             # 从连接列表移除
             with self.clients_lock:
@@ -162,7 +215,7 @@ class WebSocketControlServer:
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
-                logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] JSON解析失败: {message}")
+                logger.error(f"JSON解析失败: {message}")
                 response = {
                     "success": False,
                     "error_msg": "无效的JSON格式"
@@ -190,8 +243,13 @@ class WebSocketControlServer:
             
             task_type = data.get("type")
             task_params = data.get("params", {})
-            
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] [WebSocket] 收到控制命令: type={task_type}, params={task_params}")
+
+            # ===== 更新日志上下文：标签切换成任务类型（trace 沿用连接时的） =====
+            log_context.label = TYPE_LABEL.get(task_type, task_type or "任务")
+            obj_name = task_params.get("obj_name", "")
+            user_prompt = task_params.get("user_prompt", "")
+
+            logger.info(f'上层发来任务：找{obj_name}，原始指令="{user_prompt}"')
             
             # 调用agent执行任务
             task = {
@@ -207,12 +265,34 @@ class WebSocketControlServer:
                 }
                 await websocket.send(json.dumps(response, ensure_ascii=False))
                 return
-            
+
             # 执行任务（使用agent的execute_task方法）
             try:
-                logger.info(f"[WS] 开始执行任务 type={task_type}")
+                # ===== 开始执行：按类型给出一句易读说明 =====
+                if task_type in ("go_find_person", "go_to_object", "follow_person"):
+                    _vln_cmd, _vln_id = {
+                        "go_find_person": ("go_to_person", "person_id"),
+                        "go_to_object": ("go_to_object", "object_id"),
+                        "follow_person": ("follow_person", "person_id"),
+                    }[task_type]
+                    logger.info(f"Motion Agent 开始执行，转换成 VLN 导航请求：{_vln_cmd}/{_vln_id}={obj_name}")
+                elif task_type == "find_person":
+                    logger.info("Motion Agent 开始执行，本地相机静态找人")
+                elif task_type == "find_object":
+                    logger.info("Motion Agent 开始执行找物任务")
+                else:
+                    logger.info(f"Motion Agent 开始执行：{task_type}")
+
                 result = await self.agent.execute_task(task)
-                logger.info(f"[WS] 任务执行返回 type={task_type}, result.success={result.get('success')}, keys={list(result.keys())}")
+
+                # ===== 执行结束：如实回报 success 与返回字段 =====
+                _kind = {
+                    "go_find_person": "VLN 导航", "go_to_object": "VLN 导航",
+                    "follow_person": "VLN 导航", "find_person": "找人", "find_object": "找物",
+                }.get(task_type, "任务")
+                _succ = str(result.get("success")).lower()
+                _keys = "/".join(str(k) for k in result.keys())
+                logger.info(f"{_kind}执行结束，返回 success={_succ}（返回字段 {_keys}）")
 
                 # 构造响应（按照协议格式）
                 response = {
@@ -229,7 +309,7 @@ class WebSocketControlServer:
                 response["type"] = task_type
 
             except Exception as e:
-                logger.error(f"[WS] 任务执行异常: {e}")
+                logger.error(f"任务执行异常：{e}")
                 import traceback
                 traceback.print_exc()
                 response = {
@@ -240,12 +320,16 @@ class WebSocketControlServer:
 
             # 发送响应
             elapsed = time.time() - start_time
-            logger.info(f"[WS] 即将发送响应: type={task_type}, success={response.get('success')}, 耗时={elapsed:.2f}s")
+            _succ = str(response.get("success")).lower()
+            _res_word = "成功" if response.get("success") else "失败"
+            logger.info(f"准备回复上层：任务{_res_word} success={_succ}，本次耗时 {elapsed:.2f} 秒")
             await websocket.send(json.dumps(response, ensure_ascii=False))
-            logger.info(f"[WS] 响应已发送")
+            _addr = websocket.remote_address
+            _rip = f"{_addr[0]}:{_addr[1]}" if _addr else ""
+            logger.info(f"结果已回复给客户端 {_rip}".rstrip())
 
         except Exception as e:
-            logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 处理消息失败: {e}")
+            logger.error(f"处理消息失败: {e}")
             self.total_errors += 1
             response = {
                 "success": False,
@@ -259,7 +343,7 @@ class WebSocketControlServer:
     async def stop_async(self):
         """异步停止WebSocket服务器（正确等待连接关闭）"""
         try:
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 正在停止WebSocket控制服务器...")
+            logger.info(f"正在停止WebSocket控制服务器...")
 
             self.running = False
 
@@ -283,10 +367,10 @@ class WebSocketControlServer:
 
             self.server = None
 
-            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] WebSocket控制服务器已停止，统计: 消息总数={self.total_messages}, 错误总数={self.total_errors}")
+            logger.info(f"WebSocket控制服务器已停止，统计: 消息总数={self.total_messages}, 错误总数={self.total_errors}")
 
         except Exception as e:
-            logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 停止WebSocket控制服务器失败: {e}")
+            logger.error(f"停止WebSocket控制服务器失败: {e}")
 
     def stop(self):
         """停止WebSocket服务器（同步包装器）"""
@@ -300,7 +384,7 @@ class WebSocketControlServer:
                 with self.clients_lock:
                     self.connected_clients.clear()
         except Exception as e:
-            logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 停止WebSocket控制服务器失败: {e}")
+            logger.error(f"停止WebSocket控制服务器失败: {e}")
 
     def get_stats(self) -> Dict[str, Any]:
         """获取服务器统计信息
@@ -343,6 +427,6 @@ class WebSocketControlServer:
                 await client.send(message_str)
                 success_count += 1
             except Exception as e:
-                logger.error(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] 广播消息失败: {e}")
+                logger.error(f"广播消息失败: {e}")
         
         return success_count
