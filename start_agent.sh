@@ -1,8 +1,8 @@
 #!/bin/bash
 
 data_name=$(date +"%Y%m%d_%H%M%S")
-agent_log_dir="/userdata/roslog/agent"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+agent_log_dir="${AGENT_LOG_DIR:-${script_dir}/logs/agent}"
 
 if [ ! -d "${agent_log_dir}" ]; then
     mkdir -p "${agent_log_dir}"

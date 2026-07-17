@@ -323,7 +323,13 @@ class WebSocketControlServer:
             _succ = str(response.get("success")).lower()
             _res_word = "成功" if response.get("success") else "失败"
             logger.info(f"准备回复上层：任务{_res_word} success={_succ}，本次耗时 {elapsed:.2f} 秒")
-            await websocket.send(json.dumps(response, ensure_ascii=False))
+            try:
+                await websocket.send(json.dumps(response, ensure_ascii=False))
+            except websockets.exceptions.ConnectionClosed:
+                with self.clients_lock:
+                    self.connected_clients.discard(websocket)
+                logger.info("客户端已断开，最终结果无法发送；任务本身已执行完成")
+                return
             _addr = websocket.remote_address
             _rip = f"{_addr[0]}:{_addr[1]}" if _addr else ""
             logger.info(f"结果已回复给客户端 {_rip}".rstrip())
@@ -422,11 +428,20 @@ class WebSocketControlServer:
         with self.clients_lock:
             clients = list(self.connected_clients)
         
+        closed_clients = []
         for client in clients:
             try:
                 await client.send(message_str)
                 success_count += 1
+            except websockets.exceptions.ConnectionClosed:
+                closed_clients.append(client)
             except Exception as e:
                 logger.error(f"广播消息失败: {e}")
-        
+
+        if closed_clients:
+            with self.clients_lock:
+                for client in closed_clients:
+                    self.connected_clients.discard(client)
+            logger.info(f"跳过 {len(closed_clients)} 个已断开的 WebSocket 客户端")
+
         return success_count

@@ -167,7 +167,7 @@
       background: rgba(255, 253, 248, 0.94);
       border: 1px solid rgba(23, 33, 47, 0.1);
       color: #344054;
-      font-size: 11px;
+      font-size: 10px;
       white-space: nowrap;
       pointer-events: none;
     }
@@ -546,18 +546,18 @@
             type: "agent",
             x: 6,
             y: 46,
-            title: "输入适配层",
-            kicker: "Message Adapter",
+            title: "输入入口",
+            kicker: "Input Entry",
             summary: "接收字符串或 JSON 消息。",
-            concept: "输入适配层把不同入口来的消息统一成内部任务。它可能收到自然语言，也可能收到已经结构化的 JSON。",
-            does: "识别 type、params、user_prompt；没有明确 type 时交给 LLM 分析。",
+            concept: "输入入口是 Motion Agent 收到任务的第一站。它可能收到一句自然语言，也可能收到已经带 type 和 params 的结构化 JSON。",
+            does: "识别 type、params、user_prompt；如果已经是已知 type 就直接交给任务路由；如果没有 type 或 type 不认识，就交给 LLM 分析。",
             example: JSON.stringify({message: "到张三那儿去"}, null, 2)
           },
           {
             id: "llm",
             type: "agent",
-            x: 25,
-            y: 24,
+            x: 23,
+            y: 18,
             title: "LLM 任务拆解",
             kicker: "DeepSeek / OpenRouter",
             summary: "把自然语言变成严格 JSON。",
@@ -568,8 +568,8 @@
           {
             id: "parser",
             type: "agent",
-            x: 25,
-            y: 66,
+            x: 23,
+            y: 70,
             title: "JSON 容错解析",
             kicker: "Parser",
             summary: "从模型回复里抽取 JSON。",
@@ -580,56 +580,92 @@
           {
             id: "router",
             type: "agent",
-            x: 44,
-            y: 46,
+            x: 43,
+            y: 45,
             title: "任务路由器",
             kicker: "Task Router",
             summary: "决定任务去哪里执行。",
-            concept: "任务路由器像交通枢纽。不同 type 会进入不同执行通道。",
-            does: "go_to_object / follow_person 发给 VLN；stop 发停止；已有硬件任务走本地 ROS2/电机接口。",
-            example: "type=follow_person -> VLNClient.follow_person(...)"
+            concept: "任务路由器像交通枢纽。它不是只分三类，而是根据 smart_robot_agent.py 里的 known_task_types 和 _execute_task_by_type，把不同 type 分到 VLN、查找感知、ROS2状态/外设、本地运动电机、停止中断等执行通道。",
+            does: "导航类 go_to_object / go_find_person / follow_person 进入 VLN；find_object / find_person 做查找感知；状态和外设类走 ROS2 接口；电机和场景动作走本地运动控制；stop 和 emergency_stop 进入停止通道；未知 type 会回到 LLM 尝试重新归类，仍不支持则返回错误。",
+            example: "type=go_find_person -> 记录当前位置 -> 组装 {type:'go_to_person'} -> 发送给 VLN"
           },
           {
             id: "vlnclient",
             type: "vln",
-            x: 62,
-            y: 24,
-            title: "VLN Client",
+            x: 63,
+            y: 9,
+            title: "VLN 导航任务",
             kicker: "WebSocket Client",
-            summary: "连接 /ws/navigate 并收发协议 JSON。",
-            concept: "VLN Client 是 Motion Agent 和 VLN 服务之间的电话线。它只关心协议，不亲自导航。",
-            does: "发送 go_to_object、follow_person、stop；接收 command 和最终 result。",
-            example: "ws://192.168.31.9:18000/ws/navigate?token=DISABLE"
+            summary: "需要视觉语言导航推理的任务。",
+            concept: "这类任务不是简单查状态，而是要让 VLN 根据图像、地图和目标语义判断下一步怎么走。",
+            does: "go_to_object 发送找物导航；go_find_person 转成 go_to_person；follow_person 发送跟随请求；接收 VLN 的实时 command 和最终 result。",
+            example: JSON.stringify({type: "go_to_person", user_prompt: "请去找张三", person_id: "张三"}, null, 2)
           },
           {
-            id: "localtasks",
+            id: "searchtasks",
+            type: "data",
+            x: 63,
+            y: 31,
+            title: "查找与感知任务",
+            kicker: "Search / Perception",
+            summary: "不一定让机器人移动，先查对象或人。",
+            concept: "这类任务更像“先看/先查”，用于查找物品、人脸或历史记录。它可能读 ASM JSON、history.db、相机 RGB 或人脸识别服务。",
+            does: "find_object 先查 ASM，再查 history.db；find_person 调用相机图像和人脸识别服务；delete_person 调用 ROS2 删除人员信息。",
+            example: JSON.stringify({type: "find_person", params: {obj_name: "张三", user_prompt: "看看张三在不在"}}, null, 2)
+          },
+          {
+            id: "rosiotasks",
+            type: "data",
+            x: 63,
+            y: 53,
+            title: "ROS2 状态/外设任务",
+            kicker: "State / IO",
+            summary: "查询或设置机器人状态与外设。",
+            concept: "这类任务通常不需要 VLN 推理，直接通过 ROS2 service/topic 查询状态或设置外设。",
+            does: "包含 get_move_mode、药箱开关、升降/倾斜/屏幕、激光笔、RGB 灯等 get/set 任务。",
+            example: JSON.stringify({type: "set_rgb", params: {color: "blue", mode: "steady"}}, null, 2)
+          },
+          {
+            id: "motiontasks",
             type: "robot",
-            x: 62,
-            y: 46,
-            title: "本地任务执行",
-            kicker: "ROS2 / Motors",
-            summary: "执行已有的运动、电机、状态查询任务。",
-            concept: "有些任务不需要 VLN，比如头部回正、急停、RGB 灯、获取状态。",
-            does: "调用 smart_robot_agent.py 里已有的 _execute_task_by_type 分发逻辑。",
+            x: 63,
+            y: 75,
+            title: "本地运动/电机任务",
+            kicker: "Motors / Scenes",
+            summary: "直接控制底盘、头部、电机或场景动作。",
+            concept: "这类任务已经是机器人本地可执行动作，不需要再让 VLN 看图规划。",
+            does: "包含 back_to_last_position、go_to_door、head_reset_to_zero、set_head_motor_control、set_combine_motor_control、four_dof_head_sequence、patrol_table_inspection、obstacle_avoidance_turn 等。",
             example: JSON.stringify({type: "head_reset_to_zero", params: {}}, null, 2)
           },
           {
             id: "stop",
             type: "stop",
-            x: 62,
-            y: 67,
+            x: 82,
+            y: 17,
             title: "停止与中断",
             kicker: "Stop",
             summary: "停止 VLN 或本地运动。",
             concept: "停止不是普通动作，它要尽量快、尽量可靠。用户说停下时，Motion Agent 应同时考虑 VLN 任务和本地运动状态。",
-            does: "向 VLN 发送 {type:'stop'}，并可调用本地 stop_move / stop_navigate。",
-            example: JSON.stringify({type: "stop"}, null, 2)
+            does: "stop_follow / stop_navigate / stop_move 分别处理跟随、导航和本地移动停止；emergency_stop 会发布零速度并清空活跃导航任务。",
+            example: JSON.stringify({type: "emergency_stop", params: {}}, null, 2)
+          },
+          {
+            id: "unknown",
+            type: "stop",
+            x: 82,
+            y: 46,
+            title: "未知/自然语言兜底",
+            kicker: "Fallback",
+            summary: "不认识的 type 或无 type 输入会回到 LLM。",
+            concept: "如果输入不是已知任务，Agent 不会盲目执行。它会让 LLM 尝试把自然语言或未知 type 归类成 known_task_types 里的一个任务。",
+            does: "LLM 如果返回 default，就作为普通问答回复；如果返回已知任务，就继续执行；如果返回仍不支持的 type，就返回不支持/未知任务错误。",
+            example: JSON.stringify({type: "dance", params: {style: "random"}}, null, 2)
           },
           {
             id: "result",
             type: "agent",
-            x: 80,
-            y: 46,
+            x: 82,
+            y: 74,
             title: "结果回传",
             kicker: "Response",
             summary: "把实时 command 和最终结果返回上层。",
@@ -639,16 +675,23 @@
           }
         ],
         edges: [
-          {from: "input", to: "llm", label: "自然语言"},
-          {from: "llm", to: "parser", label: "模型回复"},
-          {from: "parser", to: "router", label: "结构化任务"},
-          {from: "input", to: "router", label: "已有 JSON"},
-          {from: "router", to: "vlnclient", label: "go_to_object / follow_person"},
-          {from: "router", to: "localtasks", label: "本地 type"},
-          {from: "router", to: "stop", label: "stop"},
-          {from: "vlnclient", to: "result", label: "command / result"},
-          {from: "localtasks", to: "result", label: "执行结果"},
-          {from: "stop", to: "result", label: "停止结果"}
+          {from: "input", to: "llm", label: "自然语言", labelDx: -10, labelDy: -10},
+          {from: "llm", to: "parser", label: "模型回复", labelDx: -22, labelDy: -24},
+          {from: "parser", to: "router", label: "结构化任务", labelDx: -18, labelDy: 6},
+          {from: "input", to: "router", label: "已有 JSON", labelDx: -22, labelDy: 16},
+          {from: "router", to: "vlnclient", label: "导航类", labelDx: -16, labelDy: -18},
+          {from: "router", to: "searchtasks", label: "查找/感知", labelDx: -6, labelDy: 55},
+          {from: "router", to: "rosiotasks", label: "状态/外设", labelDx: -4, labelDy: -54},
+          {from: "router", to: "motiontasks", label: "运动/电机", labelDx: 166, labelDy: 34},
+          {from: "router", to: "stop", label: "停止/急停", labelDx: 26, labelDy: -20},
+          {from: "router", to: "unknown", label: "未知 type", labelDx: 22, labelDy: -32},
+          {from: "unknown", to: "llm", label: "重新归类", reverse: true, labelDx: -76, labelDy: -56},
+          {from: "vlnclient", to: "result", label: "command / result", labelDx: 30, labelDy: -82},
+          {from: "searchtasks", to: "result", label: "查找结果", labelDx: 215, labelDy: -34},
+          {from: "rosiotasks", to: "result", label: "状态/设置结果", labelDx: 235, labelDy: 136},
+          {from: "motiontasks", to: "result", label: "执行结果", labelDx: -20, labelDy: 28},
+          {from: "stop", to: "result", label: "停止结果", labelDx: 315, labelDy: -8},
+          {from: "unknown", to: "result", label: "default / error", labelDx: 54, labelDy: 4}
         ]
       }
     };
@@ -698,7 +741,7 @@
       motionBtn.classList.toggle("active", viewName === "motion");
       nodeLayer.innerHTML = view.nodes.map(nodeHtml).join("");
       labelLayer.innerHTML = "";
-      setTransform(24, 16, 0.92);
+      setTransform(viewName === "motion" ? 4 : 24, viewName === "motion" ? 12 : 16, viewName === "motion" ? 0.78 : 0.92);
       view.nodes.forEach((node) => {
         const el = document.getElementById(`node-${node.id}`);
         setupNodeInteractions(el, node);
@@ -836,9 +879,12 @@
         llm: ["OpenRouter", "DeepSeek", "JSON"],
         parser: ["json.loads", "代码块", "容错"],
         router: ["type", "params", "执行通道"],
-        vlnclient: ["go_to_object", "follow_person", "stop"],
-        localtasks: ["ROS2", "电机", "状态查询"],
+        vlnclient: ["go_to_object", "go_find_person", "follow_person"],
+        searchtasks: ["find_object", "find_person", "delete_person"],
+        rosiotasks: ["get/set", "ROS2", "外设状态"],
+        motiontasks: ["电机", "场景动作", "底盘"],
         stop: ["中断", "停止", "安全"],
+        unknown: ["LLM兜底", "default", "不支持错误"],
         result: ["实时反馈", "最终结果", "error_msg"]
       };
       return map[node.id] || ["模块", "职责", "示例"];
@@ -877,8 +923,8 @@
         const label = document.createElement("div");
         label.className = "flow-label";
         label.textContent = edge.label;
-        label.style.left = `${(from.x + to.x) / 2}px`;
-        label.style.top = `${(from.y + to.y) / 2 - 18 + offset / 3}px`;
+        label.style.left = `${(from.x + to.x) / 2 + (edge.labelDx || 0)}px`;
+        label.style.top = `${(from.y + to.y) / 2 - 18 + offset / 3 + (edge.labelDy || 0)}px`;
         labelLayer.appendChild(label);
       });
     }
