@@ -38,6 +38,7 @@ class PauseMoveTest(unittest.IsolatedAsyncioTestCase):
             port = server.sockets[0].getsockname()[1]
             agent = SmartRobotAgent()
             agent.local_model_uri = f"ws://127.0.0.1:{port}/ws/navigate"
+            agent._running = True
 
             result = await agent.execute_task(
                 {"type": "pause_move", "params": {}}
@@ -72,6 +73,7 @@ class PauseMoveTest(unittest.IsolatedAsyncioTestCase):
             port = server.sockets[0].getsockname()[1]
             agent = SmartRobotAgent()
             agent.local_model_uri = f"ws://127.0.0.1:{port}/ws/navigate"
+            agent._running = True
             upstream = FakeUpstreamWebSocket()
 
             await agent.websocket_server._handle_message(

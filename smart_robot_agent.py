@@ -5996,92 +5996,51 @@ Agent已知的能力（可用工具）:
             }
             return result_data    
 
-    async def _send_vln_control_command(
-        self,
-        command_type: str,
-        response_timeout: float = 10.0,
-    ) -> Dict[str, Any]:
-        """通过一次性 WebSocket 连接向 VLN 发送控制命令。
-
-        导航任务会在 ``send_to_local_model`` 中持续读取中间结果。暂停命令如果
-        复用同一个连接，可能和导航协程同时调用 ``recv``。因此控制命令使用独立
-        的短连接，但仍复用 ``LOCAL_MODEL_URI`` 指向的 ``/ws/navigate`` 接口。
-        """
-        import websockets
-
-        try:
-            connect_func = getattr(websockets, "connect")
-            async with connect_func(
-                self.local_model_uri,
-                ping_interval=None,
-                ping_timeout=None,
-                close_timeout=3.0,
-                open_timeout=3.0,
-            ) as websocket:
-                request_data = {"type": command_type}
-                logger.info(
-                    "[VLN_CONTROL] 发送控制命令: uri=%s, data=%s",
-                    self.local_model_uri,
-                    request_data,
-                )
-                await websocket.send(json.dumps(request_data, ensure_ascii=False))
-                response_str = await asyncio.wait_for(
-                    websocket.recv(), timeout=response_timeout
-                )
-
-            try:
-                response = json.loads(response_str)
-            except json.JSONDecodeError:
-                return {
-                    "success": False,
-                    "error_msg": f"VLN返回非JSON数据: {response_str}",
-                }
-
-            if not isinstance(response, dict):
-                return {
-                    "success": False,
-                    "error_msg": "VLN返回格式错误：响应必须是JSON对象",
-                }
-
-            # VLN协议使用result；同时兼容部分Mock或旧服务使用success的情况。
-            if response.get("result") is True or response.get("success") is True:
-                return {"success": True, "error_msg": ""}
-
-            return {
-                "success": False,
-                "error_msg": response.get("error_msg") or "VLN未确认控制命令",
-            }
-        except asyncio.TimeoutError:
-            return {"success": False, "error_msg": "VLN控制接口响应超时"}
-        except Exception as e:
-            logger.error(f"[VLN_CONTROL] 调用失败: {e}")
-            return {
-                "success": False,
-                "error_msg": f"VLN控制接口调用失败: {str(e)}",
-            }
-
     async def pause_move(self) -> Dict[str, Any]:
-        """暂停当前 VLN 导航任务，但不清空任务状态、不发布零速指令。"""
-        logger.info("[PAUSE_MOVE] 开始暂停当前VLN导航任务")
+        """暂停当前 VLN 导航任务，沿用 stop_move 的本地模型通信链路。"""
+        try:
+            logger.info("[PAUSE_MOVE] 开始暂停当前VLN导航任务")
 
-        response = await self._send_vln_control_command("pause")
-        result_data = {
-            "type": "pause_move",
-            "success": bool(response.get("success", False)),
-            "error_msg": response.get("error_msg", ""),
-        }
+            # 与 stop_move 一样，通过现有 send_to_local_model 发送控制命令。
+            pause_data = {
+                "type": "pause"
+            }
+            response = await self.send_to_local_model(pause_data)
 
-        if result_data["success"]:
-            logger.info("[PAUSE_MOVE] VLN已确认暂停")
-        else:
-            logger.error(
-                "[PAUSE_MOVE] 暂停失败: %s",
-                result_data["error_msg"] or "未响应",
-            )
-            if not result_data["error_msg"]:
-                result_data["error_msg"] = "未响应"
+            if response and (
+                response.get("result") is True
+                or response.get("success") is True
+            ):
+                result_data = {
+                    "type": "pause_move",
+                    "success": True,
+                    "error_msg": ""
+                }
+                logger.info("[PAUSE_MOVE] VLN已确认暂停")
+                return result_data
 
-        return result_data
+            error_msg = (
+                response.get("error_msg")
+                if isinstance(response, dict)
+                else None
+            ) or "未响应"
+            logger.error(f"[PAUSE_MOVE] {error_msg}")
+            result_data = {
+                "type": "pause_move",
+                "success": False,
+                "error_msg": error_msg
+            }
+            return result_data
+
+        except Exception as e:
+            error_msg = f"暂停移动失败: {str(e)}"
+            logger.error(f"[PAUSE_MOVE] {error_msg}")
+            result_data = {
+                "type": "pause_move",
+                "success": False,
+                "error_msg": error_msg
+            }
+            return result_data
     
     def has_active_navigation_tasks(self) -> bool:
         """
