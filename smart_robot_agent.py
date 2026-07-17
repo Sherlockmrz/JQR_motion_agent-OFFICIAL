@@ -4668,7 +4668,7 @@ class SmartRobotAgent:
         # 已知的任务类型列表（可直接执行，无需LLM）
         self.known_task_types = {
             "find_object", "find_person", "go_to_object", "go_find_person", "follow_person",
-            "back_to_last_position", "go_to_door", "stop_follow", "stop_navigate", "stop_move",
+            "back_to_last_position", "go_to_door", "stop_follow", "stop_navigate", "stop_move", "pause_move",
             "get_move_mode", "get_medicine_box_state", "set_medicine_box_switch",
             "get_robot_rise_state", "set_robot_rise_jqr",
             "get_robot_tilt_state", "set_robot_tilt_jqr",
@@ -5033,6 +5033,7 @@ Agent已知的能力（可用工具）:
             "stop_follow": "停止跟随",
             "stop_navigate": "停止导航",
             "stop_move": "停止移动",
+            "pause_move": "暂停当前VLN导航任务",
             "get_move_mode": "获取当前运动模式",
             "set_medicine_box_switch": "控制药箱开关",
             "get_medicine_box_state": "获取药箱状态",
@@ -5429,6 +5430,10 @@ Agent已知的能力（可用工具）:
             return stop_navigate()
         elif task_type == "stop_move" and hasattr(self, 'ros2_interface'):
             result = await self.stop_move()
+            result["type"] = task_type
+            return result
+        elif task_type == "pause_move":
+            result = await self.pause_move()
             result["type"] = task_type
             return result
         elif task_type == "emergency_stop":
@@ -5990,6 +5995,93 @@ Agent已知的能力（可用工具）:
                 "result": error_msg
             }
             return result_data    
+
+    async def _send_vln_control_command(
+        self,
+        command_type: str,
+        response_timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """通过一次性 WebSocket 连接向 VLN 发送控制命令。
+
+        导航任务会在 ``send_to_local_model`` 中持续读取中间结果。暂停命令如果
+        复用同一个连接，可能和导航协程同时调用 ``recv``。因此控制命令使用独立
+        的短连接，但仍复用 ``LOCAL_MODEL_URI`` 指向的 ``/ws/navigate`` 接口。
+        """
+        import websockets
+
+        try:
+            connect_func = getattr(websockets, "connect")
+            async with connect_func(
+                self.local_model_uri,
+                ping_interval=None,
+                ping_timeout=None,
+                close_timeout=3.0,
+                open_timeout=3.0,
+            ) as websocket:
+                request_data = {"type": command_type}
+                logger.info(
+                    "[VLN_CONTROL] 发送控制命令: uri=%s, data=%s",
+                    self.local_model_uri,
+                    request_data,
+                )
+                await websocket.send(json.dumps(request_data, ensure_ascii=False))
+                response_str = await asyncio.wait_for(
+                    websocket.recv(), timeout=response_timeout
+                )
+
+            try:
+                response = json.loads(response_str)
+            except json.JSONDecodeError:
+                return {
+                    "success": False,
+                    "error_msg": f"VLN返回非JSON数据: {response_str}",
+                }
+
+            if not isinstance(response, dict):
+                return {
+                    "success": False,
+                    "error_msg": "VLN返回格式错误：响应必须是JSON对象",
+                }
+
+            # VLN协议使用result；同时兼容部分Mock或旧服务使用success的情况。
+            if response.get("result") is True or response.get("success") is True:
+                return {"success": True, "error_msg": ""}
+
+            return {
+                "success": False,
+                "error_msg": response.get("error_msg") or "VLN未确认控制命令",
+            }
+        except asyncio.TimeoutError:
+            return {"success": False, "error_msg": "VLN控制接口响应超时"}
+        except Exception as e:
+            logger.error(f"[VLN_CONTROL] 调用失败: {e}")
+            return {
+                "success": False,
+                "error_msg": f"VLN控制接口调用失败: {str(e)}",
+            }
+
+    async def pause_move(self) -> Dict[str, Any]:
+        """暂停当前 VLN 导航任务，但不清空任务状态、不发布零速指令。"""
+        logger.info("[PAUSE_MOVE] 开始暂停当前VLN导航任务")
+
+        response = await self._send_vln_control_command("pause")
+        result_data = {
+            "type": "pause_move",
+            "success": bool(response.get("success", False)),
+            "error_msg": response.get("error_msg", ""),
+        }
+
+        if result_data["success"]:
+            logger.info("[PAUSE_MOVE] VLN已确认暂停")
+        else:
+            logger.error(
+                "[PAUSE_MOVE] 暂停失败: %s",
+                result_data["error_msg"] or "未响应",
+            )
+            if not result_data["error_msg"]:
+                result_data["error_msg"] = "未响应"
+
+        return result_data
     
     def has_active_navigation_tasks(self) -> bool:
         """
