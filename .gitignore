@@ -4,3 +4,13 @@
 !.env.example
 
 Jrobot_agent_base.tar
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+history.db
+history.db-*
+
+# Local-only generated documentation and agent scratch files
+_local_docs_archive_do_not_upload/
+.agents/

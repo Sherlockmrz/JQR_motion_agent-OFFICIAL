@@ -4,12 +4,12 @@
 
 Default usage (no ROS 2 or external VLN service required)::
 
-    python -m unittest -v test_pause_move.py
+    python -m unittest -v test_pause_move_extended.py
 
 Optional manual helpers::
 
-    python test_pause_move.py --mock-vln --mode success
-    python test_pause_move.py --live --uri ws://127.0.0.1:8766
+    python test_pause_move_extended.py --mock-vln --mode success
+    python test_pause_move_extended.py --live --uri ws://127.0.0.1:8766
 
 The test module injects a small in-memory ``config`` module before importing
 ``smart_robot_agent``.  This keeps the tests independent of the project's
