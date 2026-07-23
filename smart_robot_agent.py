@@ -54,11 +54,23 @@ class MotorResultCode(IntEnum):
     REJECTED = 104
     MOTOR_ERROR_ABORTED = 105
 
-class MedicineBoxStatus(IntEnum):
+class LegacyMedicineBoxStatus(IntEnum):
     """药箱状态值 (实际协议中为 float，但值为整数)"""
     CLOSED = 0    # 关闭
     OPEN = 1      # 开启
     RUNNING = 2   # 运行中
+
+
+class MedicineBoxStateCode(IntEnum):
+    """MCU new-SDK native medicine-box states."""
+    UNINIT = 0
+    UNKNOWN = 1
+    CLOSED = 2
+    OPENING = 3
+    OPEN = 4
+    CLOSING = 5
+    STOPPED = 6
+    FAULT = 7
 
 class CallbackGroupType(IntEnum):
     """ROS2 回调组类型"""
@@ -76,6 +88,10 @@ HEAD_PITCH_MAX = math.radians(30)     # 俯仰上限（正值=低头）
 HEAD_YAW_MIN = math.radians(-110)     # 偏航下限
 HEAD_YAW_MAX = math.radians(110)      # 偏航上限
 BASE_YAW_MAX = math.radians(118)      # 底盘偏航最大角度
+
+# wake_turn_to_person 后动态找人/找物的场景上下文。
+# chassis_rotation 按底层约定解释为绝对目标角度。
+DEFAULT_SEARCH_CHASSIS_ROTATION = 0.0
 
 # 兼容旧常量名
 HEAD_PITCH_DOWN = HEAD_PITCH_MIN
@@ -110,6 +126,9 @@ jqr_ros_msgs = None
 BatteryLevel = None
 MedicineBoxState = None
 MedicineBoxSwitch = None
+MedicineBoxCommand = None
+MedicineBoxStatus = None
+ClearFault = None
 MoveMode = None
 RobotRise = None
 RobotRiseState = None
@@ -122,6 +141,8 @@ RgbBrightnessColorSet = None
 RgbState = None
 RgbLightStrip = None
 RgbLightStripState = None
+StatusLightScene = None
+StatusLightState = None
 LaserPointer = None
 LaserPointerState = None
 
@@ -239,11 +260,13 @@ try:
         from jqr_ros_msgs.msg import BatteryLevel
         from jqr_ros_msgs.srv import (
             MedicineBoxState, MedicineBoxSwitch,
+            MedicineBoxCommand, MedicineBoxStatus, ClearFault,
             MoveMode,
             RobotRise, RobotRiseState,
             RobotTilt, RobotTiltState,
             ScreenTilt, ScreenTiltState,
             RgbLightStrip, RgbLightStripState,
+            StatusLightScene, StatusLightState,
             LaserPointer, LaserPointerState,
             FaceDelete
         )
@@ -666,6 +689,15 @@ class ROS2Interface:
         self.service_call_results = {}  # {call_id: (future, event, result)}
         self.call_id_counter = 0  # 服务调用ID计数器
         self.service_call_lock = threading.Lock()  # 服务调用锁
+
+        # Desired MCU product-status light. The primary deployment is DAY.
+        self._desired_status_light = None
+        self._status_light_lock = threading.Lock()
+        self._status_light_command_lock = threading.Lock()
+        self._status_light_monitor_thread = None
+        self._status_light_monitor_running = False
+        self._status_light_last_uptime_ms = None
+        self._status_light_was_unavailable = False
 
         # 如果ROS2可用，初始化rclpy
         if ROS2_AVAILABLE:
@@ -2380,6 +2412,7 @@ class ROS2Interface:
         """清理ROS2资源"""
         global rclpy
         try:
+            self._stop_status_light_monitor()
             # 停止处理线程
             self.stop_ros2_spin_thread()
 
@@ -3300,10 +3333,158 @@ class ROS2Interface:
             return None
             
     # ======================
+    # 机器状态灯相关接口
+    # ======================
+
+    def _set_robot_light_state_legacy_unused(self, state: Any = None, scene: Any = None,
+                              ambient: Any = "day",
+                              restart_pattern: Any = True) -> Dict[str, Any]:
+        """设置机器状态灯场景，兼容旧版 state=1/2 协议。
+
+        新协议通过 ``scene`` 控制 MCU 支持的全部 0～10 场景，通过
+        ``ambient`` 选择 day/night。旧协议 state=1 映射 working，
+        state=2 映射 waiting。
+        """
+        scene_map = {
+            "off": 0,
+            "waiting": 1,
+            "idle": 1,
+            "working": 2,
+            "safety_alert": 3,
+            "fault": 4,
+            "estop": 5,
+            "low_battery": 6,
+            "critical_battery": 7,
+            "charging": 8,
+            "upgrading": 9,
+            "pairing": 10,
+        }
+        scene_names = {
+            0: "off", 1: "waiting", 2: "working", 3: "safety_alert",
+            4: "fault", 5: "estop", 6: "low_battery",
+            7: "critical_battery", 8: "charging", 9: "upgrading",
+            10: "pairing",
+        }
+        #这里的两个变量都是“设置灯光 function 的输入参数”：
+        #state：smart_robot_agent 旧版本自己定义的兼容参数；
+        #scene：MCU 新文档定义的正式场景参数。
+        if state is not None and scene is not None:
+            return {
+                "type": "set_robot_light_state",
+                "success": False,
+                "error_msg": "state和scene不能同时提供"
+            }
+
+        if scene is None:
+            state_key = str(state).strip() if state is not None else ""
+            legacy_map = {"1": 2, "2": 1}
+            if state_key not in legacy_map:
+                return {
+                    "type": "set_robot_light_state",
+                    "success": False,
+                    "error_msg": "请提供state=1/2，或提供scene场景"
+                }
+            scene_value = legacy_map[state_key]
+        else:
+            if isinstance(scene, bool):
+                scene_value = -1
+            elif isinstance(scene, int):
+                scene_value = scene
+            elif isinstance(scene, float) and scene.is_integer():
+                scene_value = int(scene)
+            else:
+                scene_key = str(scene).strip().lower().replace("-", "_")
+                if scene_key.isdigit():
+                    scene_value = int(scene_key)
+                else:
+                    scene_value = scene_map.get(scene_key, -1)
+
+            if scene_value not in scene_names:
+                return {
+                    "type": "set_robot_light_state",
+                    "success": False,
+                    "error_msg": "scene无效，支持off/waiting/working/safety_alert/"
+                                 "fault/estop/low_battery/critical_battery/"
+                                 "charging/upgrading/pairing或0到10"
+                }
+
+        if isinstance(ambient, bool):
+            ambient_value = -1
+        elif ambient in (0, 1):
+            ambient_value = int(ambient)
+        else:
+            ambient_key = str(ambient).strip().lower()
+            ambient_value = {"day": 0, "night": 1, "0": 0, "1": 1}.get(
+                ambient_key, -1
+            )
+
+        if ambient_value not in (0, 1):
+            return {
+                "type": "set_robot_light_state",
+                "success": False,
+                "error_msg": "ambient无效，仅支持day/night或0/1"
+            }
+
+        if not isinstance(restart_pattern, bool):
+            return {
+                "type": "set_robot_light_state",
+                "success": False,
+                "error_msg": "restart_pattern必须是布尔值true或false"
+            }
+
+        scene_name = scene_names[scene_value]
+        ambient_name = "day" if ambient_value == 0 else "night"
+        logger.info(
+            f"[SET_ROBOT_LIGHT_STATE] 设置机器状态灯: "
+            f"scene={scene_value}({scene_name}), ambient={ambient_name}, "
+            f"restart_pattern={restart_pattern}"
+        )
+
+        result = self._call_ros2_service_async(
+            "/set_status_light_scene",
+            CallbackGroupType.REENTRANT,
+            "jqr_ros_msgs/srv/StatusLightScene",
+            {
+                "scene": scene_value,
+                "ambient": ambient_value,
+                "restart_pattern": restart_pattern
+            },
+            timeout=5.0
+        )
+
+        if not result.get("success"):
+            error_msg = result.get("error_msg") or "未响应"
+            logger.error(f"[SET_ROBOT_LIGHT_STATE] {error_msg}")
+            return {
+                "type": "set_robot_light_state",
+                "success": False,
+                "error_msg": error_msg
+            }
+
+        response = result.get("response", {})
+        if response.get("accepted") is not True:
+            error_msg = response.get("message") or "MCU未接受灯光命令"
+            logger.error(f"[SET_ROBOT_LIGHT_STATE] {error_msg}")
+            return {
+                "type": "set_robot_light_state",
+                "success": False,
+                "error_msg": error_msg
+            }
+
+        logger.info(
+            f"[SET_ROBOT_LIGHT_STATE] MCU已接受{scene_name}/{ambient_name}灯光命令"
+        )
+        return {
+            "type": "set_robot_light_state",
+            "success": True,
+            "error_msg": ""
+        }
+
+    # ======================
     # 药箱控制相关接口
     # ======================
     
-    def set_medicine_box_switch(self, switch: bool, speed_stage: int) -> Dict[str, Any]:
+    def _set_medicine_box_switch_legacy_unused(self, switch: bool, speed_stage: int) -> Dict[str, Any]:
         """控制药箱开关（使用话题控制）
 
         Args:
@@ -3344,7 +3525,7 @@ class ROS2Interface:
                 "error_msg": f"设置药箱{'打开' if switch else '关闭'}失败: {str(e)}"
             }
     
-    def get_medicine_box_state(self) -> Dict[str, Any]:
+    def _get_medicine_box_state_legacy_unused(self) -> Dict[str, Any]:
         """获取药箱状态（从 robot_state 话题获取）
 
         Returns:
@@ -3354,13 +3535,13 @@ class ROS2Interface:
             medicine_box_value = self.robot_state["medicine_box"]
 
             # 映射状态值: 0.0=关闭, 1.0=开启, 2.0=运行中
-            if medicine_box_value == MedicineBoxStatus.CLOSED:
+            if medicine_box_value == LegacyMedicineBoxStatus.CLOSED:
                 state = False
                 state_desc = "关闭"
-            elif medicine_box_value == MedicineBoxStatus.OPEN:
+            elif medicine_box_value == LegacyMedicineBoxStatus.OPEN:
                 state = True
                 state_desc = "开启"
-            elif medicine_box_value == MedicineBoxStatus.RUNNING:
+            elif medicine_box_value == LegacyMedicineBoxStatus.RUNNING:
                 state = True
                 state_desc = "运行中"
             else:
@@ -3380,6 +3561,519 @@ class ROS2Interface:
                 "state": False,
                 "description": f"获取药箱状态失败: {str(e)}"
             }
+
+    # ======================
+    # MCU new-SDK auxiliary services
+    # ======================
+
+    def clear_fault(self, fault_mask: Any = 0xFFFFFFFF) -> Dict[str, Any]:
+        """Request MCU fault clearing through /clear_fault."""
+        try:
+            if isinstance(fault_mask, bool):
+                raise ValueError
+            if isinstance(fault_mask, str):
+                mask_value = int(fault_mask.strip(), 0)
+            else:
+                mask_value = int(fault_mask)
+            if isinstance(fault_mask, float) and not fault_mask.is_integer():
+                raise ValueError
+        except (TypeError, ValueError):
+            return {
+                "type": "clear_fault", "success": False,
+                "error_msg": "fault_mask必须是0到0xFFFFFFFF的整数"
+            }
+        if not 0 <= mask_value <= 0xFFFFFFFF:
+            return {
+                "type": "clear_fault", "success": False,
+                "error_msg": "fault_mask超出uint32范围"
+            }
+
+        result = self._call_ros2_service_async(
+            "/clear_fault", CallbackGroupType.REENTRANT,
+            "jqr_ros_msgs/srv/ClearFault", {"fault_mask": mask_value},
+            timeout=5.0
+        )
+        if not result.get("success"):
+            return {
+                "type": "clear_fault", "success": False,
+                "fault_mask": mask_value,
+                "error_msg": result.get("error_msg", "clear_fault服务调用失败")
+            }
+        response = result.get("response", {})
+        result_number = int(response.get("result_number", 0))
+        message = str(response.get("result_msg", ""))
+        success = result_number == 1
+        return {
+            "type": "clear_fault", "success": success,
+            "fault_mask": mask_value, "result_number": result_number,
+            "message": message,
+            "error_msg": "" if success else (message or "MCU未清除故障")
+        }
+
+    @staticmethod
+    def _normalize_status_light_scene(scene: Any) -> Optional[int]:
+        scene_map = {
+            "off": 0, "waiting": 1, "wating": 1, "idle": 1,
+            "working": 2, "safety_alert": 3, "fault": 4, "estop": 5,
+            "low_battery": 6, "critical_battery": 7, "charging": 8,
+            "upgrading": 9, "pairing": 10,
+        }
+        if isinstance(scene, bool):
+            return None
+        if isinstance(scene, int):
+            value = scene
+        elif isinstance(scene, float) and scene.is_integer():
+            value = int(scene)
+        else:
+            key = str(scene).strip().lower().replace("-", "_")
+            value = int(key) if key.isdigit() else scene_map.get(key, -1)
+        return value if 0 <= value <= 10 else None
+
+    @staticmethod
+    def _normalize_light_ambient(ambient: Any) -> Optional[int]:
+        if isinstance(ambient, bool):
+            return None
+        if ambient in (0, 1):
+            return int(ambient)
+        return {"day": 0, "night": 1, "0": 0, "1": 1}.get(
+            str(ambient).strip().lower()
+        )
+
+    def get_status_light_state(self) -> Dict[str, Any]:
+        """Read the MCU status-light execution snapshot."""
+        result = self._call_ros2_service_async(
+            "/get_status_light_state", CallbackGroupType.REENTRANT,
+            "jqr_ros_msgs/srv/StatusLightState", {}, timeout=3.0
+        )
+        if not result.get("success"):
+            return {
+                "type": "get_status_light_state", "success": False,
+                "valid": False,
+                "error_msg": result.get("error_msg", "状态灯查询失败")
+            }
+        response = result.get("response", {})
+        #valid=True 才说明 MCU 状态有效且没有过期
+        valid = bool(response.get("valid", False))
+        scene_value = int(response.get("scene", 0))
+        ambient_value = int(response.get("ambient", 0))
+        mode_value = int(response.get("control_mode", 0))
+        effect_value = int(response.get("effect", 0))
+        scene_names = {
+            0: "off", 1: "waiting", 2: "working", 3: "safety_alert",
+            4: "fault", 5: "estop", 6: "low_battery",
+            7: "critical_battery", 8: "charging", 9: "upgrading",
+            10: "pairing",
+        }
+        output = {
+            "type": "get_status_light_state", "success": valid,
+            "valid": valid,
+            #MCU 运行时间，用于判断 MCU 是否重启
+            "uptime_ms": int(response.get("uptime_ms", 0)),
+            "last_command_seq": int(response.get("last_command_seq", 0)),
+            #最近一次灯光命令序号
+            "control_mode": mode_value,
+            "control_mode_name": {0: "off", 1: "raw", 2: "scene"}.get(mode_value, "unknown"),
+            "scene": scene_value,
+            "scene_name": scene_names.get(scene_value, "unknown"),
+            "ambient": ambient_value,
+            "ambient_name": "day" if ambient_value == 0 else "night",
+            "effect": effect_value,
+            "effect_name": {0: "off", 1: "steady", 2: "blink", 3: "breathe"}.get(
+                effect_value, "unknown"
+            ),
+            "flags": int(response.get("flags", 0)),
+            "r_permille": int(response.get("r_permille", 0)),
+            "g_permille": int(response.get("g_permille", 0)),
+            "b_permille": int(response.get("b_permille", 0)),
+            "w_permille": int(response.get("w_permille", 0)),
+            "message": str(response.get("message", "")),
+            "error_msg": "" if valid else "MCU状态灯状态无效或已过期",
+        }
+        return output
+    #当 MCU 接受场景命令后，这个 function 记住上层期望状态
+    def _remember_status_light(self, scene: int, ambient: int,
+                               restart_pattern: bool) -> None:
+        if not hasattr(self, "_status_light_lock"):
+            self._status_light_lock = threading.Lock()
+        with self._status_light_lock:
+            self._desired_status_light = {
+                "scene": scene,
+                "ambient": ambient,
+                "restart_pattern": restart_pattern,
+            }
+    #确保灯光恢复线程正在运行
+    def _ensure_status_light_monitor(self) -> None:
+        if not getattr(self, "initialized", False) or not getattr(self, "node", None):
+            return
+        thread = getattr(self, "_status_light_monitor_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        self._status_light_monitor_running = True
+        self._status_light_monitor_thread = threading.Thread(
+            target=self._status_light_monitor_worker,
+            name="StatusLightRecovery",
+            daemon=True,
+        )
+        #创建名为 StatusLightRecovery 的后台线程。
+        #线程实际执行 _status_light_monitor_worker()
+        self._status_light_monitor_thread.start()
+    #停止灯光恢复线程
+    def _stop_status_light_monitor(self) -> None:
+        self._status_light_monitor_running = False
+        thread = getattr(self, "_status_light_monitor_thread", None)
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5.5)
+        self._status_light_monitor_thread = None
+    #USB 重连后，上层应重新发送当前业务场景
+    def _status_light_monitor_worker(self) -> None:
+        """Reapply the desired scene after USB/MCU recovery or state drift."""
+        while getattr(self, "_status_light_monitor_running", False):
+            try:
+                lock = getattr(self, "_status_light_lock", None)
+                if lock is None:
+                    desired = None
+                else:
+                    with lock:
+                        value = getattr(self, "_desired_status_light", None)
+                        desired = dict(value) if value else None
+                if desired:
+                    status = self.get_status_light_state()
+                    if status.get("success"):
+                        uptime = int(status.get("uptime_ms", 0))
+                        last_uptime = getattr(self, "_status_light_last_uptime_ms", None)
+                        restarted = last_uptime is not None and uptime < last_uptime
+                        recovered = bool(getattr(self, "_status_light_was_unavailable", False))
+                        mode_matches = status.get("control_mode") == 2 or (
+                            desired["scene"] == 0 and status.get("control_mode") == 0
+                        )
+                        scene_matches = (
+                            mode_matches
+                            and status.get("scene") == desired["scene"]
+                            and status.get("ambient") == desired["ambient"]
+                        )
+                        self._status_light_last_uptime_ms = uptime
+                        self._status_light_was_unavailable = False
+                        if recovered or restarted or not scene_matches:
+                            logger.warning(
+                                "[STATUS_LIGHT_RECOVERY] MCU恢复或场景漂移，重新发送当前业务场景"
+                            )
+                            self.set_status_light_scene(
+                                **desired, verify=False
+                            )
+                    else:
+                        self._status_light_was_unavailable = True
+            except Exception as exc:
+                self._status_light_was_unavailable = True
+                logger.warning(f"[STATUS_LIGHT_RECOVERY] 状态检查失败: {exc}")
+            time.sleep(2.0)
+
+    def set_status_light_scene(self, scene: Any, ambient: Any = "day",
+                               restart_pattern: Any = True,
+                               verify: Any = True,
+                               timeout: Any = 3.0) -> Dict[str, Any]:
+        """Set a documented MCU status-light scene and optionally verify feedback."""
+        scene_value = self._normalize_status_light_scene(scene)
+        ambient_value = self._normalize_light_ambient(ambient)
+        if scene_value is None:
+            return {
+                "type": "set_status_light_scene", "success": False,
+                "error_msg": "scene无效，仅支持0到10及文档中的场景名"
+            }
+        if ambient_value is None:
+            return {
+                "type": "set_status_light_scene", "success": False,
+                "error_msg": "ambient无效，仅支持day/night或0/1"
+            }
+        if not isinstance(restart_pattern, bool) or not isinstance(verify, bool):
+            return {
+                "type": "set_status_light_scene", "success": False,
+                "error_msg": "restart_pattern和verify必须是布尔值"
+            }
+        try:
+            timeout_value = float(timeout)
+            if timeout_value <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return {
+                "type": "set_status_light_scene", "success": False,
+                "error_msg": "timeout必须是正数"
+            }
+
+        if not hasattr(self, "_status_light_command_lock"):
+            self._status_light_command_lock = threading.Lock()
+        with self._status_light_command_lock:
+            result = self._call_ros2_service_async(
+                "/set_status_light_scene", CallbackGroupType.REENTRANT,
+                "jqr_ros_msgs/srv/StatusLightScene",
+                {
+                    "scene": scene_value,
+                    "ambient": ambient_value,
+                    "restart_pattern": restart_pattern,
+                },
+                timeout=5.0,
+            )
+            if not result.get("success"):
+                return {
+                    "type": "set_status_light_scene", "success": False,
+                    "scene": scene_value, "ambient": ambient_value,
+                    "error_msg": result.get("error_msg", "状态灯服务调用失败")
+                }
+            response = result.get("response", {})
+            if response.get("accepted") is not True:
+                message = str(response.get("message", ""))
+                return {
+                    "type": "set_status_light_scene", "success": False,
+                    "scene": scene_value, "ambient": ambient_value,
+                    "accepted": False,
+                    "error_msg": message or "MCU未接受状态灯命令",
+                }
+            self._remember_status_light(scene_value, ambient_value, restart_pattern)
+        self._ensure_status_light_monitor()
+        base_output = {
+            "type": "set_status_light_scene", "accepted": True,
+            "scene": scene_value, "ambient": ambient_value,
+            "restart_pattern": restart_pattern,
+            "message": str(response.get("message", "")),
+        }
+        if not verify:
+            return {**base_output, "success": True, "verified": False, "error_msg": ""}
+
+        deadline = time.monotonic() + timeout_value
+        last_status = None
+        while time.monotonic() < deadline:
+            last_status = self.get_status_light_state()
+            mode_matches = last_status.get("control_mode") == 2 or (
+                scene_value == 0 and last_status.get("control_mode") == 0
+            )
+            if (
+                last_status.get("success") and mode_matches
+                and last_status.get("scene") == scene_value
+                and last_status.get("ambient") == ambient_value
+            ):
+                return {
+                    **base_output, "success": True, "verified": True,
+                    "status": last_status, "error_msg": ""
+                }
+            time.sleep(0.1)
+        return {
+            **base_output, "success": False, "verified": False,
+            "status": last_status,
+            "error_msg": "等待MCU状态灯场景回读超时",
+        }
+
+    def set_robot_light_state(self, state: Any = None, scene: Any = None,
+                              ambient: Any = "day",
+                              restart_pattern: Any = True,
+                              verify: Any = True,
+                              timeout: Any = 3.0) -> Dict[str, Any]:
+        """Compatibility entry: legacy state=1/2 or documented scene, never both."""
+        if state is not None and scene is not None:
+            return {
+                "type": "set_robot_light_state", "success": False,
+                "error_msg": "state是旧版1/2兼容参数，不能和scene同时提供"
+            }
+        if scene is None:
+            legacy_map = {"1": 2, "2": 1}
+            scene = legacy_map.get(str(state).strip() if state is not None else "")
+            if scene is None:
+                return {
+                    "type": "set_robot_light_state", "success": False,
+                    "error_msg": "请提供旧版state=1/2或文档场景scene"
+                }
+        result = self.set_status_light_scene(
+            scene=scene, ambient=ambient, restart_pattern=restart_pattern,
+            verify=verify, timeout=timeout,
+        )
+        result["type"] = "set_robot_light_state"
+        return result
+
+    @staticmethod
+    def _normalize_medicine_command(command: Any) -> Optional[int]:
+        names = {"stop": 0, "open": 1, "close": 2}
+        if isinstance(command, bool):
+            return None
+        if isinstance(command, int):
+            value = command
+        elif isinstance(command, float) and command.is_integer():
+            value = int(command)
+        else:
+            key = str(command).strip().lower()
+            value = int(key) if key.isdigit() else names.get(key, -1)
+        return value if value in (0, 1, 2) else None
+
+    def get_medicine_box_status(self) -> Dict[str, Any]:
+        """Read the full native MCU medicine-box status."""
+        result = self._call_ros2_service_async(
+            "/get_medicine_box_status", CallbackGroupType.REENTRANT,
+            "jqr_ros_msgs/srv/MedicineBoxStatus", {}, timeout=3.0
+        )
+        if not result.get("success"):
+            return {
+                "type": "get_medicine_box_status", "success": False,
+                "valid": False,
+                "error_msg": result.get("error_msg", "药箱状态查询失败")
+            }
+        response = result.get("response", {})
+        valid = bool(response.get("valid", False))
+        state_value = int(response.get("state", 0))
+        source_value = int(response.get("command_source", 0))
+        state_names = {
+            0: "uninit", 1: "unknown", 2: "closed", 3: "opening",
+            4: "open", 5: "closing", 6: "stopped", 7: "fault",
+        }
+        output = {
+            "type": "get_medicine_box_status", "success": valid,
+            "valid": valid,
+            "uptime_ms": int(response.get("uptime_ms", 0)),
+            "state": state_value,
+            "state_name": state_names.get(state_value, "invalid"),
+            "target_command": int(response.get("target_command", 0)),
+            "command_source": source_value,
+            "command_source_name": {0: "none", 1: "button", 2: "host", 3: "safety"}.get(
+                source_value, "invalid"
+            ),
+            "io_flags": int(response.get("io_flags", 0)),
+            "fault_flags": int(response.get("fault_flags", 0)),
+            "current_ma": int(response.get("current_ma", 0)),
+            "angle_raw": int(response.get("angle_raw", 0)),
+            "last_command_seq": int(response.get("last_command_seq", 0)),
+            "last_result": int(response.get("last_result", 0)),
+            "message": str(response.get("message", "")),
+            "error_msg": "" if valid else "MCU药箱状态无效或已过期",
+        }
+        return output
+
+    def set_medicine_box_command(self, command: Any, wait: Any = True,
+                                 timeout: Any = 12.0,
+                                 poll_interval: Any = 0.1) -> Dict[str, Any]:
+        """Send STOP/OPEN/CLOSE and optionally wait for the matching MCU result."""
+        command_value = self._normalize_medicine_command(command)
+        if command_value is None:
+            return {
+                "type": "set_medicine_box_command", "success": False,
+                "error_msg": "command无效，仅支持0=STOP、1=OPEN、2=CLOSE"
+            }
+        if not isinstance(wait, bool):
+            return {
+                "type": "set_medicine_box_command", "success": False,
+                "error_msg": "wait必须是布尔值"
+            }
+        try:
+            timeout_value = float(timeout)
+            interval_value = float(poll_interval)
+            if timeout_value <= 0 or not 0.02 <= interval_value <= 1.0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return {
+                "type": "set_medicine_box_command", "success": False,
+                "error_msg": "timeout必须为正数，poll_interval必须在0.02到1.0秒之间"
+            }
+
+        result = self._call_ros2_service_async(
+            "/set_medicine_box_command", CallbackGroupType.REENTRANT,
+            "jqr_ros_msgs/srv/MedicineBoxCommand",
+            {"command": command_value}, timeout=5.0,
+        )
+        if not result.get("success"):
+            return {
+                "type": "set_medicine_box_command", "success": False,
+                "command": command_value,
+                "error_msg": result.get("error_msg", "药箱命令服务调用失败")
+            }
+        response = result.get("response", {})
+        accepted = response.get("accepted") is True
+        command_seq = int(response.get("command_seq", 0))
+        message = str(response.get("message", ""))
+        base_output = {
+            "type": "set_medicine_box_command", "accepted": accepted,
+            "command": command_value, "command_seq": command_seq,
+            "message": message,
+        }
+        if not accepted:
+            return {
+                **base_output, "success": False,
+                "error_msg": message or "MCU未接受药箱命令"
+            }
+        if not wait:
+            return {
+                **base_output, "success": True, "completed": False,
+                "error_msg": ""
+            }
+
+        deadline = time.monotonic() + timeout_value
+        last_status = None
+        while time.monotonic() < deadline:
+            last_status = self.get_medicine_box_status()
+            current_command = (
+                last_status.get("valid") is True
+                and last_status.get("command_source") == 2
+                and last_status.get("last_command_seq") == command_seq
+                and last_status.get("target_command") == command_value
+            )
+            if current_command:
+                state_value = last_status.get("state")
+                fault_flags = int(last_status.get("fault_flags", 0))
+                if state_value == MedicineBoxStateCode.FAULT or fault_flags != 0:
+                    return {
+                        **base_output, "success": False, "completed": False,
+                        "status": last_status,
+                        "error_msg": f"药箱进入故障状态，fault_flags=0x{fault_flags:04x}",
+                    }
+                completed = (
+                    (command_value == 1 and state_value == MedicineBoxStateCode.OPEN)
+                    or (command_value == 2 and state_value == MedicineBoxStateCode.CLOSED)
+                    or (
+                        command_value == 0
+                        and state_value not in (
+                            MedicineBoxStateCode.OPENING,
+                            MedicineBoxStateCode.CLOSING,
+                        )
+                    )
+                )
+                if completed:
+                    return {
+                        **base_output, "success": True, "completed": True,
+                        "status": last_status, "error_msg": ""
+                    }
+            time.sleep(interval_value)
+        return {
+            **base_output, "success": False, "completed": False,
+            "status": last_status,
+            "error_msg": "等待匹配本次command_seq的药箱到位状态超时",
+        }
+    #这是旧任务名称的兼容入口，但内部已经改用新 SDK
+    def set_medicine_box_switch(self, switch: Any,
+                                speed_stage: Any = 1,
+                                timeout: Any = 12.0) -> Dict[str, Any]:
+        """Legacy task mapped to the native OPEN/CLOSE service with completion wait."""
+        if not isinstance(switch, bool):
+            return {
+                "type": "set_medicine_box_switch", "success": False,
+                "error_msg": "switch必须是布尔值"
+            }
+        if speed_stage not in (1, 2, "1", "2"):
+            return {
+                "type": "set_medicine_box_switch", "success": False,
+                "error_msg": "speed_stage兼容参数仅支持1或2"
+            }
+        result = self.set_medicine_box_command(
+            command=1 if switch else 2, wait=True, timeout=timeout
+        )
+        result["type"] = "set_medicine_box_switch"
+        result["speed_stage_ignored_by_new_sdk"] = int(speed_stage)
+        return result
+
+    def get_medicine_box_state(self) -> Dict[str, Any]:
+        """Legacy coarse state backed by the native detailed status service."""
+        status = self.get_medicine_box_status()
+        state_value = status.get("state")
+        status.update({
+            "type": "get_medicine_box_state",
+            "state_code": state_value,
+            "state": state_value == MedicineBoxStateCode.OPEN,
+            "description": status.get("state_name", "unknown"),
+        })
+        return status
 
     def set_rgb_light_strip(self, brightness_set: Optional[int] = None, rgb_switch: Optional[bool] = None,
                              color: Optional[str] = None, is_incremental: bool = False,
@@ -4226,6 +4920,190 @@ class ROS2Interface:
                 "error_msg": f"四联组合电机控制异常: {str(e)}"
             }
 
+    async def wake_turn_to_person(self, angle: Any = 255,
+                                  turn_speed: Any = 2) -> Dict[str, Any]:
+        """头部按声源方向转向说话人。
+
+        ``angle`` 使用弧度，坐标约定为 0 表示机器人正前方、逆时针
+        增加；255 使用默认 45 度。当前版本只控制头部 yaw，不控制底盘。
+        """
+        if isinstance(angle, bool):
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "angle必须是弧度数值或255"
+            }
+
+        try:
+            angle_value = float(angle)
+        except (TypeError, ValueError):
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "angle必须是弧度数值或255"
+            }
+
+        if not math.isfinite(angle_value):
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "angle必须是有限数值"
+            }
+
+        if angle_value == 255.0:
+            angle_value = math.radians(45.0)
+        elif not 0.0 <= angle_value <= 2.0 * math.pi:
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "angle超出范围，应为0到2π弧度或255"
+            }
+
+        if isinstance(turn_speed, bool):
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "turn_speed必须是0、1或2"
+            }
+
+        try:
+            speed_value = int(turn_speed)
+            if isinstance(turn_speed, float) and not turn_speed.is_integer():
+                raise ValueError
+            if isinstance(turn_speed, str) and str(speed_value) != turn_speed.strip():
+                raise ValueError
+        except (TypeError, ValueError):
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "turn_speed必须是0、1或2"
+            }
+
+        if speed_value not in (0, 1, 2):
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "turn_speed必须是0、1或2"
+            }
+
+        logger.info(
+            f"[WAKE_TURN_TO_PERSON] 开始转向说话人: "
+            f"angle={angle_value:.4f}rad, turn_speed={speed_value}"
+        )
+        result = await self.set_four_combine_motor_control(
+            control_yaw=True,
+            yaw_angle=angle_value,
+            speed_level=speed_value
+        )
+
+        if result.get("success"):
+            logger.info("[WAKE_TURN_TO_PERSON] 头部转向完成")
+            return {
+                "type": "wake_turn_to_person",
+                "success": True,
+                "error_msg": ""
+            }
+
+        error_msg = result.get("error_msg") or "未响应"
+        logger.error(f"[WAKE_TURN_TO_PERSON] {error_msg}")
+        return {
+            "type": "wake_turn_to_person",
+            "success": False,
+            "error_msg": error_msg
+        }
+
+    async def forward_head(self, angle: Any = 255,
+                           turn_speed: Any = 2) -> Dict[str, Any]:
+        """头部前倾关切。
+
+        ``angle`` 使用弧度且正值表示前倾，允许范围为 0～30 度；
+        255 使用默认 15 度。当前版本只控制头部 pitch，不控制机身或底盘。
+        """
+        if isinstance(angle, bool):
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "angle必须是弧度数值或255"
+            }
+
+        try:
+            angle_value = float(angle)
+        except (TypeError, ValueError):
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "angle必须是弧度数值或255"
+            }
+
+        if not math.isfinite(angle_value):
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "angle必须是有限数值"
+            }
+
+        if angle_value == 255.0:
+            angle_value = math.radians(15.0)
+        elif not 0.0 <= angle_value <= HEAD_PITCH_MAX:
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "angle超出安全范围，应为0到0.5236弧度或255"
+            }
+
+        if isinstance(turn_speed, bool):
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "turn_speed必须是0、1或2"
+            }
+
+        try:
+            speed_value = int(turn_speed)
+            if isinstance(turn_speed, float) and not turn_speed.is_integer():
+                raise ValueError
+            if isinstance(turn_speed, str) and str(speed_value) != turn_speed.strip():
+                raise ValueError
+        except (TypeError, ValueError):
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "turn_speed必须是0、1或2"
+            }
+
+        if speed_value not in (0, 1, 2):
+            return {
+                "type": "forward_head",
+                "success": False,
+                "error_msg": "turn_speed必须是0、1或2"
+            }
+
+        logger.info(
+            f"[FORWARD_HEAD] 开始头部前倾: "
+            f"angle={angle_value:.4f}rad, turn_speed={speed_value}"
+        )
+        result = await self.set_four_combine_motor_control(
+            control_pitch=True,
+            pitch_angle=angle_value,
+            speed_level=speed_value
+        )
+
+        if result.get("success"):
+            logger.info("[FORWARD_HEAD] 头部前倾完成")
+            return {
+                "type": "forward_head",
+                "success": True,
+                "error_msg": ""
+            }
+
+        error_msg = result.get("error_msg") or "未响应"
+        logger.error(f"[FORWARD_HEAD] {error_msg}")
+        return {
+            "type": "forward_head",
+            "success": False,
+            "error_msg": error_msg
+        }
+
     async def set_four_combine_waypoint_control(self, waypoints: List[Dict[str, Any]],
                                                  pose_mode: int = 0,
                                                  timeout: float = 60.0) -> Dict[str, Any]:
@@ -4613,6 +5491,12 @@ class SmartRobotAgent:
     def __init__(self):
         self.ros2_interface = ROS2Interface()
 
+        # wake_turn_to_person 成功后保留一次动态搜索上下文。
+        # 使用线程锁是因为USB消息可能在不同线程/事件循环中并发执行。
+        self._wake_turn_completed_at: bool = False
+        self._wake_turn_angle: float = 0.0
+        self._wake_turn_context_lock = threading.Lock()
+
         # 创建USB串口通信管理器
         self.usb_manager = USBCoordinateManager(self)
 
@@ -4674,6 +5558,10 @@ class SmartRobotAgent:
             "find_object", "find_person", "go_to_object", "go_find_person", "follow_person",
             "back_to_last_position", "go_to_door", "stop_follow", "stop_navigate", "stop_move", "pause_move",
             "get_move_mode", "get_medicine_box_state", "set_medicine_box_switch",
+            "set_medicine_box_command", "get_medicine_box_status", "clear_fault",
+            "set_robot_light_state", "set_status_light_scene", "get_status_light_state",
+            "wake_turn_to_person",
+            "forward_head",
             "get_robot_rise_state", "set_robot_rise_jqr",
             "get_robot_tilt_state", "set_robot_tilt_jqr",
             "get_screen_tilt_state", "set_screen_tilt_jqr",
@@ -4689,6 +5577,87 @@ class SmartRobotAgent:
             "obstacle_avoidance_turn", "move_forward_with_head_sweep",
             "emergency_stop", "keyboard_motor_control"
         }
+
+    def _mark_wake_turn_context(self, angle: Any = 255) -> None:
+        """记录成功的wake及其实际角度，供下一次动态搜索消费。"""
+        angle_value = float(angle)
+        if angle_value == 255.0:
+            angle_value = math.radians(45.0)
+
+        with self._wake_turn_context_lock:
+            self._wake_turn_completed_at = True
+            self._wake_turn_angle = angle_value
+        logger.info(
+            "[SEARCH_POSE] wake_turn_to_person成功，场景A标记已设置："
+            "底盘将使用wake角度%.6frad（%.1f°）",
+            angle_value,
+            math.degrees(angle_value),
+        )
+
+    def _consume_wake_turn_context(self) -> tuple[bool, float]:
+        """原子消费wake标记；返回是否为场景A以及对应的wake角度。"""
+        with self._wake_turn_context_lock:
+            after_wake_turn = self._wake_turn_completed_at
+            wake_angle = self._wake_turn_angle
+            # 标记只允许一次动态搜索使用；中间的其它任务不会触碰它。
+            self._wake_turn_completed_at = False
+            self._wake_turn_angle = 0.0
+
+        if not after_wake_turn:
+            return False, DEFAULT_SEARCH_CHASSIS_ROTATION
+
+        logger.info(
+            "[SEARCH_POSE] 消费wake_turn_to_person场景A标记，使用wake角度%.6frad（%.1f°）",
+            wake_angle,
+            math.degrees(wake_angle),
+        )
+        return True, wake_angle
+
+    async def _reset_dynamic_search_pose(self, task_type: str) -> Dict[str, Any]:
+        """动态找人/找物前归零头部并设置底盘绝对角度，失败时继续任务。"""
+        after_wake_turn, wake_angle = self._consume_wake_turn_context()
+        scene = "A" if after_wake_turn else "B"
+        chassis_rotation = wake_angle if after_wake_turn else DEFAULT_SEARCH_CHASSIS_ROTATION
+        logger.info(
+            "[SEARCH_POSE] %s开始前执行场景%s归零：头部yaw/roll/pitch=0，"
+            "底盘绝对目标角=%.6frad（%.1f°）",
+            task_type,
+            scene,
+            chassis_rotation,
+            math.degrees(chassis_rotation),
+        )
+
+        try:
+            result = await self.ros2_interface.set_four_combine_motor_control(
+                control_yaw=True,
+                yaw_angle=0.0,
+                control_roll=True,
+                roll_angle=0.0,
+                control_pitch=True,
+                pitch_angle=0.0,
+                control_chassis_rotate=True,
+                chassis_rotation=chassis_rotation,
+                speed_level=0,
+            )
+        except Exception as exc:
+            logger.error(
+                "[SEARCH_POSE] 场景%s归零发生异常，但按策略继续执行%s：%s",
+                scene,
+                task_type,
+                exc,
+            )
+            return {"success": False, "error_msg": str(exc), "scene": scene}
+
+        if result.get("success"):
+            logger.info("[SEARCH_POSE] 场景%s归零完成，继续执行%s", scene, task_type)
+        else:
+            logger.error(
+                "[SEARCH_POSE] 场景%s归零失败，但按策略继续执行%s：%s",
+                scene,
+                task_type,
+                result.get("error_msg") or f"result={result.get('result', '未知')}",
+            )
+        return result
     
     async def initialize(self):
         """初始化agent"""
@@ -5041,6 +6010,23 @@ Agent已知的能力（可用工具）:
             "get_move_mode": "获取当前运动模式",
             "set_medicine_box_switch": "控制药箱开关",
             "get_medicine_box_state": "获取药箱状态",
+            "set_medicine_box_command": (
+                "原生药箱控制：command=stop/open/close或0/1/2；默认等待匹配"
+                "command_seq的MCU到位状态，timeout默认12秒"
+            ),
+            "get_medicine_box_status": "获取药箱完整MCU状态、故障、命令来源和序号",
+            "clear_fault": "清除MCU故障位；fault_mask默认0xFFFFFFFF",
+            "set_robot_light_state": (
+                "设置机器状态灯；兼容state=1工作/2待机，也支持scene=off/waiting/"
+                "working/safety_alert/fault/estop/low_battery/critical_battery/"
+                "charging/upgrading/pairing及ambient=day/night"
+            ),
+            "set_status_light_scene": (
+                "设置文档定义的状态灯scene，默认ambient=day、restart_pattern=true并回读验证"
+            ),
+            "get_status_light_state": "查询MCU实际执行的状态灯场景、效果、flags和RGBW诊断快照",
+            "wake_turn_to_person": "头部按声源方向转向说话人（angle单位为弧度）",
+            "forward_head": "头部前倾关切（angle单位为弧度，255默认15度）",
             "get_robot_rise_state": "获取机器人升降状态",
             "set_robot_rise_jqr": "控制机器人升降",
             "get_robot_tilt_state": "获取机器人俯仰状态",
@@ -5457,6 +6443,40 @@ Agent已知的能力（可用工具）:
             result = self.ros2_interface.set_medicine_box_switch(**params)
             result["type"] = task_type
             return result
+        elif task_type == "set_medicine_box_command" and hasattr(self, 'ros2_interface'):
+            result = self.ros2_interface.set_medicine_box_command(**params)
+            result["type"] = task_type
+            return result
+        elif task_type == "get_medicine_box_status" and hasattr(self, 'ros2_interface'):
+            result = self.ros2_interface.get_medicine_box_status()
+            result["type"] = task_type
+            return result
+        elif task_type == "clear_fault" and hasattr(self, 'ros2_interface'):
+            result = self.ros2_interface.clear_fault(**params)
+            result["type"] = task_type
+            return result
+        elif task_type == "set_robot_light_state" and hasattr(self, 'ros2_interface'):
+            result = self.ros2_interface.set_robot_light_state(**params)
+            result["type"] = task_type
+            return result
+        elif task_type == "set_status_light_scene" and hasattr(self, 'ros2_interface'):
+            result = self.ros2_interface.set_status_light_scene(**params)
+            result["type"] = task_type
+            return result
+        elif task_type == "get_status_light_state" and hasattr(self, 'ros2_interface'):
+            result = self.ros2_interface.get_status_light_state()
+            result["type"] = task_type
+            return result
+        elif task_type == "wake_turn_to_person" and hasattr(self, 'ros2_interface'):
+            result = await self.ros2_interface.wake_turn_to_person(**params)
+            if result.get("success"):
+                self._mark_wake_turn_context(params.get("angle", 255))
+            result["type"] = task_type
+            return result
+        elif task_type == "forward_head" and hasattr(self, 'ros2_interface'):
+            result = await self.ros2_interface.forward_head(**params)
+            result["type"] = task_type
+            return result
         elif task_type == "get_robot_rise_state" and hasattr(self, 'ros2_interface'):
             result = self.ros2_interface.get_robot_rise_state()
             result["type"] = task_type
@@ -5792,6 +6812,8 @@ Agent已知的能力（可用工具）:
     async def go_to_object(self, obj_name: str, pixel_position: Optional[List[float]] = None) -> Dict[str, Any]:
         """导航到物体位置"""
         try:
+            await self._reset_dynamic_search_pose("go_to_object")
+
             # 构造符合导航服务期望的数据格式
             model_data = {
                 "type": "go_to_object",
@@ -5892,6 +6914,8 @@ Agent已知的能力（可用工具）:
     async def go_find_person(self, obj_name: str, user_prompt: str, **kwargs) -> Dict[str, Any]:
         """查找人员"""
         try:
+            await self._reset_dynamic_search_pose("go_find_person")
+
             model_data = {
                 "type": "go_to_person",
                 "user_prompt": user_prompt,

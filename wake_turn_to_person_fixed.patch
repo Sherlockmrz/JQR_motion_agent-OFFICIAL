@@ -1,0 +1,340 @@
+diff --git a/smart_robot_agent.py b/smart_robot_agent.py
+index 598b1e5..dedd1b6 100644
+--- a/smart_robot_agent.py
++++ b/smart_robot_agent.py
+@@ -4292,6 +4292,98 @@ class ROS2Interface:
+                 "error_msg": f"四联组合电机控制异常: {str(e)}"
+             }
+ 
++    async def wake_turn_to_person(self, angle: Any = 255,
++                                  turn_speed: Any = 2) -> Dict[str, Any]:
++        """头部按声源方向转向说话人。
++
++        ``angle`` 使用弧度，坐标约定为 0 表示机器人正前方、逆时针
++        增加；255 使用默认 45 度。当前版本只控制头部 yaw，不控制底盘。
++        """
++        if isinstance(angle, bool):
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "angle必须是弧度数值或255"
++            }
++
++        try:
++            angle_value = float(angle)
++        except (TypeError, ValueError):
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "angle必须是弧度数值或255"
++            }
++
++        if not math.isfinite(angle_value):
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "angle必须是有限数值"
++            }
++
++        if angle_value == 255.0:
++            angle_value = math.radians(45.0)
++        elif not 0.0 <= angle_value <= 2.0 * math.pi:
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "angle超出范围，应为0到2π弧度或255"
++            }
++
++        if isinstance(turn_speed, bool):
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "turn_speed必须是0、1或2"
++            }
++
++        try:
++            speed_value = int(turn_speed)
++            if isinstance(turn_speed, float) and not turn_speed.is_integer():
++                raise ValueError
++            if isinstance(turn_speed, str) and str(speed_value) != turn_speed.strip():
++                raise ValueError
++        except (TypeError, ValueError):
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "turn_speed必须是0、1或2"
++            }
++
++        if speed_value not in (0, 1, 2):
++            return {
++                "type": "wake_turn_to_person",
++                "success": False,
++                "error_msg": "turn_speed必须是0、1或2"
++            }
++
++        logger.info(
++            f"[WAKE_TURN_TO_PERSON] 开始转向说话人: "
++            f"angle={angle_value:.4f}rad, turn_speed={speed_value}"
++        )
++        result = await self.set_four_combine_motor_control(
++            control_yaw=True,
++            yaw_angle=angle_value,
++            speed_level=speed_value
++        )
++
++        if result.get("success"):
++            logger.info("[WAKE_TURN_TO_PERSON] 头部转向完成")
++            return {
++                "type": "wake_turn_to_person",
++                "success": True,
++                "error_msg": ""
++            }
++
++        error_msg = result.get("error_msg") or "未响应"
++        logger.error(f"[WAKE_TURN_TO_PERSON] {error_msg}")
++        return {
++            "type": "wake_turn_to_person",
++            "success": False,
++            "error_msg": error_msg
++        }
++
+     async def set_four_combine_waypoint_control(self, waypoints: List[Dict[str, Any]],
+                                                  pose_mode: int = 0,
+                                                  timeout: float = 60.0) -> Dict[str, Any]:
+@@ -4741,6 +4833,7 @@ class SmartRobotAgent:
+             "back_to_last_position", "go_to_door", "stop_follow", "stop_navigate", "stop_move", "pause_move",
+             "get_move_mode", "get_medicine_box_state", "set_medicine_box_switch",
+             "set_robot_light_state",
++            "wake_turn_to_person",
+             "get_robot_rise_state", "set_robot_rise_jqr",
+             "get_robot_tilt_state", "set_robot_tilt_jqr",
+             "get_screen_tilt_state", "set_screen_tilt_jqr",
+@@ -5109,6 +5202,7 @@ Agent已知的能力（可用工具）:
+             "set_medicine_box_switch": "控制药箱开关",
+             "get_medicine_box_state": "获取药箱状态",
+             "set_robot_light_state": "设置机器状态灯（1=工作，2=待机）",
++            "wake_turn_to_person": "头部按声源方向转向说话人（angle单位为弧度）",
+             "get_robot_rise_state": "获取机器人升降状态",
+             "set_robot_rise_jqr": "控制机器人升降",
+             "get_robot_tilt_state": "获取机器人俯仰状态",
+@@ -5529,6 +5623,10 @@ Agent已知的能力（可用工具）:
+             result = self.ros2_interface.set_robot_light_state(**params)
+             result["type"] = task_type
+             return result
++        elif task_type == "wake_turn_to_person" and hasattr(self, 'ros2_interface'):
++            result = await self.ros2_interface.wake_turn_to_person(**params)
++            result["type"] = task_type
++            return result
+         elif task_type == "get_robot_rise_state" and hasattr(self, 'ros2_interface'):
+             result = self.ros2_interface.get_robot_rise_state()
+             result["type"] = task_type
+diff --git a/mock_four_motor_node.py b/mock_four_motor_node.py
+index 88d3120..af11a27 100755
+--- a/mock_four_motor_node.py
++++ b/mock_four_motor_node.py
+@@ -3,7 +3,7 @@
+ """四自由度头颈运控组合电机控制模拟节点
+ 
+ 模拟下游电机控制器，订阅 /four_combine_motor_control 话题，
+-根据指令模拟执行并在 /four_combine_motor_control_result 话题发布反馈。
++根据指令模拟执行并在 /combine_motor_control_result 话题发布反馈。
+ 
+ 话题数据类型：std_msgs/msg/Float32MultiArray（12字段）
+     data[0]  task_id
+@@ -75,7 +75,7 @@ class MockFourMotorNode(Node):
+ 
+         self.result_publisher = self.create_publisher(
+             Float32MultiArray,
+-            '/four_combine_motor_control_result',
++            '/combine_motor_control_result',
+             10,
+         )
+ 
+@@ -83,7 +83,7 @@ class MockFourMotorNode(Node):
+             f"四联模拟电机节点启动 | 模式: {mode} | 延迟: {delay if delay is not None else '自动'}"
+         )
+         self.get_logger().info("订阅: /four_combine_motor_control")
+-        self.get_logger().info("发布: /four_combine_motor_control_result")
++        self.get_logger().info("发布: /combine_motor_control_result")
+ 
+     def _on_motor_command(self, msg):
+         data = msg.data
+diff --git a/test_four_combine_motor.py b/test_four_combine_motor.py
+index d98a71e..5e78dd6 100644
+--- a/test_four_combine_motor.py
++++ b/test_four_combine_motor.py
+@@ -3,7 +3,7 @@
+ """四自由度头颈运控组合电机控制端到端测试脚本（上游业务模拟）
+ 
+ 模拟上游业务节点：直接发布指令到 /four_combine_motor_control（12字段），
+-并订阅 /four_combine_motor_control_result 收集下游（mock_four_motor_node）反馈。
++并订阅 /combine_motor_control_result 收集下游（mock_four_motor_node）反馈。
+ 
+ 字段顺序（与协议一致）：
+     data[0]  task_id
+@@ -71,7 +71,7 @@ class UpstreamTestClient(Node):
+ 
+         self.subscription = self.create_subscription(
+             Float32MultiArray,
+-            '/four_combine_motor_control_result',
++            '/combine_motor_control_result',
+             self._on_result,
+             10,
+         )
+@@ -82,7 +82,7 @@ class UpstreamTestClient(Node):
+ 
+         self.get_logger().info("上游测试客户端已启动")
+         self.get_logger().info("发布: /four_combine_motor_control")
+-        self.get_logger().info("订阅: /four_combine_motor_control_result")
++        self.get_logger().info("订阅: /combine_motor_control_result")
+ 
+     def _on_result(self, msg):
+         data = msg.data
+diff --git a/test_wake_turn_to_person.py b/test_wake_turn_to_person.py
+new file mode 100644
+index 0000000..84642bf
+--- /dev/null
++++ b/test_wake_turn_to_person.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++"""wake_turn_to_person 离线测试，不依赖 ROS 2 或真机。"""
++
++import math
++import unittest
++from unittest.mock import AsyncMock, MagicMock
++
++from smart_robot_agent import ROS2Interface, SmartRobotAgent
++
++
++class WakeTurnToPersonTest(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.interface = ROS2Interface.__new__(ROS2Interface)
++        self.interface.set_four_combine_motor_control = AsyncMock()
++
++    async def test_radian_angle_is_forwarded_to_yaw(self):
++        self.interface.set_four_combine_motor_control.return_value = {
++            "success": True,
++            "result": 101,
++            "task_id": 123456,
++        }
++
++        result = await self.interface.wake_turn_to_person(0.7854, 2)
++
++        self.assertEqual(
++            result,
++            {"type": "wake_turn_to_person", "success": True, "error_msg": ""},
++        )
++        self.interface.set_four_combine_motor_control.assert_awaited_once_with(
++            control_yaw=True,
++            yaw_angle=0.7854,
++            speed_level=2,
++        )
++
++    async def test_255_uses_default_45_degrees(self):
++        self.interface.set_four_combine_motor_control.return_value = {
++            "success": True,
++            "result": 101,
++        }
++
++        await self.interface.wake_turn_to_person(255)
++
++        kwargs = self.interface.set_four_combine_motor_control.await_args.kwargs
++        self.assertAlmostEqual(kwargs["yaw_angle"], math.pi / 4, places=6)
++        self.assertEqual(kwargs["speed_level"], 2)
++
++    async def test_motor_failure_is_propagated(self):
++        self.interface.set_four_combine_motor_control.return_value = {
++            "success": False,
++            "error_msg": "四联电机拒绝执行",
++        }
++
++        result = await self.interface.wake_turn_to_person(math.pi / 2, 1)
++
++        self.assertFalse(result["success"])
++        self.assertEqual(result["error_msg"], "四联电机拒绝执行")
++
++    async def test_invalid_angle_is_rejected_without_motor_command(self):
++        for angle in (-0.1, 2 * math.pi + 0.1, "not-a-number", float("nan"), True):
++            with self.subTest(angle=angle):
++                self.interface.set_four_combine_motor_control.reset_mock()
++                result = await self.interface.wake_turn_to_person(angle, 2)
++                self.assertFalse(result["success"])
++                self.interface.set_four_combine_motor_control.assert_not_awaited()
++
++    async def test_invalid_speed_is_rejected(self):
++        for speed in (-1, 3, 1.5, "fast", True):
++            with self.subTest(speed=speed):
++                self.interface.set_four_combine_motor_control.reset_mock()
++                result = await self.interface.wake_turn_to_person(0.5, speed)
++                self.assertFalse(result["success"])
++                self.interface.set_four_combine_motor_control.assert_not_awaited()
++
++
++class WakeTurnDispatchTest(unittest.IsolatedAsyncioTestCase):
++    async def test_agent_dispatches_upper_protocol(self):
++        agent = SmartRobotAgent.__new__(SmartRobotAgent)
++        agent.ros2_interface = MagicMock()
++        agent.ros2_interface.wake_turn_to_person = AsyncMock(return_value={
++            "type": "wake_turn_to_person",
++            "success": True,
++            "error_msg": "",
++        })
++
++        result = await agent._execute_task_by_type(
++            "wake_turn_to_person",
++            {"angle": 0.7854, "turn_speed": 2},
++        )
++
++        agent.ros2_interface.wake_turn_to_person.assert_awaited_once_with(
++            angle=0.7854,
++            turn_speed=2,
++        )
++        self.assertEqual(
++            result,
++            {"type": "wake_turn_to_person", "success": True, "error_msg": ""},
++        )
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/manual_wake_turn_client.py b/manual_wake_turn_client.py
+new file mode 100644
+index 0000000..5cde842
+--- /dev/null
++++ b/manual_wake_turn_client.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++"""通过上层 WebSocket 协议手动测试 wake_turn_to_person。"""
++
++import argparse
++import asyncio
++import json
++
++import websockets
++
++
++async def main(uri: str, angle: float, turn_speed: int) -> None:
++    request = {
++        "type": "wake_turn_to_person",
++        "params": {
++            "angle": angle,
++            "turn_speed": turn_speed,
++        },
++    }
++    print("发送:", json.dumps(request, ensure_ascii=False))
++    async with websockets.connect(uri, open_timeout=5) as websocket:
++        await websocket.send(json.dumps(request, ensure_ascii=False))
++        response = json.loads(await asyncio.wait_for(websocket.recv(), timeout=40))
++    print("收到:", json.dumps(response, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("angle", type=float, help="声源角度，单位为弧度；255使用默认45度")
++    parser.add_argument("--turn-speed", type=int, choices=[0, 1, 2], default=2)
++    parser.add_argument("--uri", default="ws://127.0.0.1:8766")
++    args = parser.parse_args()
++    asyncio.run(main(args.uri, args.angle, args.turn_speed))
+
+
+

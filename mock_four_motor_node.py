@@ -3,7 +3,7 @@
 """四自由度头颈运控组合电机控制模拟节点
 
 模拟下游电机控制器，订阅 /four_combine_motor_control 话题，
-根据指令模拟执行并在 /four_combine_motor_control_result 话题发布反馈。
+根据指令模拟执行并在 /combine_motor_control_result 话题发布反馈。
 
 话题数据类型：std_msgs/msg/Float32MultiArray（12字段）
     data[0]  task_id
@@ -75,7 +75,7 @@ class MockFourMotorNode(Node):
 
         self.result_publisher = self.create_publisher(
             Float32MultiArray,
-            '/four_combine_motor_control_result',
+            '/combine_motor_control_result',
             10,
         )
 
@@ -83,7 +83,7 @@ class MockFourMotorNode(Node):
             f"四联模拟电机节点启动 | 模式: {mode} | 延迟: {delay if delay is not None else '自动'}"
         )
         self.get_logger().info("订阅: /four_combine_motor_control")
-        self.get_logger().info("发布: /four_combine_motor_control_result")
+        self.get_logger().info("发布: /combine_motor_control_result")
 
     def _on_motor_command(self, msg):
         data = msg.data

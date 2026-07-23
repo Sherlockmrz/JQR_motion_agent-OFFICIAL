@@ -3,7 +3,7 @@
 """四自由度头颈运控组合电机控制端到端测试脚本（上游业务模拟）
 
 模拟上游业务节点：直接发布指令到 /four_combine_motor_control（12字段），
-并订阅 /four_combine_motor_control_result 收集下游（mock_four_motor_node）反馈。
+并订阅 /combine_motor_control_result 收集下游（mock_four_motor_node）反馈。
 
 字段顺序（与协议一致）：
     data[0]  task_id
@@ -71,7 +71,7 @@ class UpstreamTestClient(Node):
 
         self.subscription = self.create_subscription(
             Float32MultiArray,
-            '/four_combine_motor_control_result',
+            '/combine_motor_control_result',
             self._on_result,
             10,
         )
@@ -82,7 +82,7 @@ class UpstreamTestClient(Node):
 
         self.get_logger().info("上游测试客户端已启动")
         self.get_logger().info("发布: /four_combine_motor_control")
-        self.get_logger().info("订阅: /four_combine_motor_control_result")
+        self.get_logger().info("订阅: /combine_motor_control_result")
 
     def _on_result(self, msg):
         data = msg.data

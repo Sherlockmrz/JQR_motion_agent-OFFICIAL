@@ -10,13 +10,18 @@ fi
 
 source /opt/ros/humble/setup.bash
 cd "${script_dir}" || exit 1
-source install/setup.bash
 
 if [ -f "${script_dir}/.env" ]; then
     set -a
     . "${script_dir}/.env"
     set +a
 fi
+
+jqr_base_ws="${JQR_BASE_WS:-/app/jqr_ws}"
+if [ -f "${jqr_base_ws}/install/setup.bash" ]; then
+    source "${jqr_base_ws}/install/setup.bash"
+fi
+source install/setup.bash
 
 echo "Starting Smart Robot Agent, log: ${agent_log_dir}/agent_${data_name}.log"
 nohup python3 smart_robot_agent.py >>"${agent_log_dir}/agent_${data_name}.log" 2>&1 &

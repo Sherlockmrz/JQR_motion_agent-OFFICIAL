@@ -1,0 +1,5 @@
+# Fault bits to clear. Use 0xFFFFFFFF to clear all faults.
+uint32 fault_mask
+---
+std_msgs/UInt8 result_number  # 0: failed, 1: succeeded
+std_msgs/String result_msg

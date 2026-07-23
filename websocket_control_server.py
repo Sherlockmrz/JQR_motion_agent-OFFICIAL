@@ -52,7 +52,55 @@ TYPE_LABEL = {
     "find_object": "找物",
     "go_to_object": "找物",
     "follow_person": "跟随",
+    "get_medicine_box_state": "药箱状态",
+    "set_medicine_box_switch": "药箱开关",
+    "set_medicine_box_command": "药箱控制",
+    "get_medicine_box_status": "药箱诊断",
+    "clear_fault": "故障清除",
+    "set_robot_light_state": "机器状态灯",
+    "set_status_light_scene": "机器状态灯",
+    "get_status_light_state": "状态灯查询",
+    "wake_turn_to_person": "唤醒转头",
+    "forward_head": "头部前倾",
+    "set_head_motor_control": "头部控制",
+    "set_combine_motor_control": "头颈控制",
+    "set_four_combine_motor_control": "四联头颈控制",
+    "set_four_combine_waypoint_control": "四联头颈序列",
+    "four_dof_head_sequence": "四自由度头颈序列",
+    "head_sweep_sequence": "头颈扫描序列",
+    "head_reset_to_zero": "头部归零",
+    "set_chassis_rotate_params": "底盘转向参数",
 }
+
+
+TASK_ACTION_TEXT = {
+    "get_medicine_box_state": "读取药箱开关状态",
+    "set_medicine_box_switch": "设置药箱开关",
+    "set_medicine_box_command": "下发原生药箱控制命令",
+    "get_medicine_box_status": "读取药箱MCU完整状态",
+    "clear_fault": "清除MCU故障",
+    "set_robot_light_state": "设置机器状态灯",
+    "set_status_light_scene": "设置机器状态灯场景",
+    "get_status_light_state": "读取机器状态灯实际状态",
+    "wake_turn_to_person": "按声源方向转动头部",
+    "forward_head": "执行头部前倾动作",
+    "set_head_motor_control": "下发头部电机控制",
+    "set_combine_motor_control": "下发组合头颈控制",
+    "set_four_combine_motor_control": "下发四联头颈与底盘组合控制",
+    "set_four_combine_waypoint_control": "执行四联头颈多路点序列",
+    "four_dof_head_sequence": "执行四自由度头颈动作序列",
+    "head_sweep_sequence": "执行头颈扫描序列",
+    "head_reset_to_zero": "执行头部归零",
+    "set_chassis_rotate_params": "设置底盘旋转速度与加速度参数",
+}
+
+
+def _params_for_log(params: Dict[str, Any]) -> str:
+    """稳定输出上层参数，中文不转义，无法序列化时退化为repr。"""
+    try:
+        return json.dumps(params, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(params)
 
 
 def _make_trace() -> str:
@@ -249,7 +297,14 @@ class WebSocketControlServer:
             obj_name = task_params.get("obj_name", "")
             user_prompt = task_params.get("user_prompt", "")
 
-            logger.info(f'上层发来任务：找{obj_name}，原始指令="{user_prompt}"')
+            if task_type in ("find_person", "go_find_person", "find_object", "go_to_object"):
+                logger.info(f'上层发来任务：找{obj_name}，原始指令="{user_prompt}"')
+            else:
+                task_name = TYPE_LABEL.get(task_type, task_type or "任务")
+                logger.info(
+                    f"上层发来任务：{task_name}（{task_type}），"
+                    f"参数={_params_for_log(task_params)}"
+                )
             
             # 调用agent执行任务
             task = {
@@ -280,6 +335,11 @@ class WebSocketControlServer:
                     logger.info("Motion Agent 开始执行，本地相机静态找人")
                 elif task_type == "find_object":
                     logger.info("Motion Agent 开始执行找物任务")
+                elif task_type in TASK_ACTION_TEXT:
+                    logger.info(
+                        f"Motion Agent 开始执行，{TASK_ACTION_TEXT[task_type]}："
+                        f"{_params_for_log(task_params)}"
+                    )
                 else:
                     logger.info(f"Motion Agent 开始执行：{task_type}")
 
@@ -288,8 +348,8 @@ class WebSocketControlServer:
                 # ===== 执行结束：如实回报 success 与返回字段 =====
                 _kind = {
                     "go_find_person": "VLN 导航", "go_to_object": "VLN 导航",
-                    "follow_person": "VLN 导航", "find_person": "找人", "find_object": "找物",
-                }.get(task_type, "任务")
+                    "follow_person": "VLN 导航",
+                }.get(task_type, TYPE_LABEL.get(task_type, "任务"))
                 _succ = str(result.get("success")).lower()
                 _keys = "/".join(str(k) for k in result.keys())
                 logger.info(f"{_kind}执行结束，返回 success={_succ}（返回字段 {_keys}）")
