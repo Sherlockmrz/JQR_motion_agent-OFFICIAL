@@ -1,28 +1,28 @@
 #!/bin/bash
 
-# 1. 设置设备权限
-echo "正在设置设备权限..."
-echo "sunrise" | sudo -S chmod 777 /dev/rk
-
-# 检查权限设置是否成功
-if [ $? -ne 0 ]; then
-    echo "错误：设置设备权限失败"
-    exit 1
-fi
-
-# 2. 配置日志目录
-data_name=`date +"%Y%m%d_%H%M%S"`
-agent_log_dir="/userdata/roslog/agent"
+data_name=$(date +"%Y%m%d_%H%M%S")
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+agent_log_dir="${AGENT_LOG_DIR:-${script_dir}/logs/agent}"
 
 if [ ! -d "${agent_log_dir}" ]; then
-    mkdir -p ${agent_log_dir}
+    mkdir -p "${agent_log_dir}"
 fi
 
-# 3. 配置ROS2环境
 source /opt/ros/humble/setup.bash
+cd "${script_dir}" || exit 1
+
+if [ -f "${script_dir}/.env" ]; then
+    set -a
+    . "${script_dir}/.env"
+    set +a
+fi
+
+jqr_base_ws="${JQR_BASE_WS:-/app/jqr_ws}"
+if [ -f "${jqr_base_ws}/install/setup.bash" ]; then
+    source "${jqr_base_ws}/install/setup.bash"
+fi
 source install/setup.bash
 
-# 4. 启动代理并记录日志（后台运行）
-echo "正在启动机器人代理程序，日志: ${agent_log_dir}/agent_${data_name}.log"
-nohup python3 smart_robot_agent.py >>${agent_log_dir}/agent_${data_name}.log 2>&1 &
-echo "Agent 已启动，进程 ID: $!"
+echo "Starting Smart Robot Agent, log: ${agent_log_dir}/agent_${data_name}.log"
+nohup python3 smart_robot_agent.py >>"${agent_log_dir}/agent_${data_name}.log" 2>&1 &
+echo "Agent started, PID: $!"

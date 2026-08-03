@@ -1,0 +1,26 @@
+---
+uint8 STATE_UNINIT=0
+uint8 STATE_UNKNOWN=1
+uint8 STATE_CLOSED=2
+uint8 STATE_OPENING=3
+uint8 STATE_OPEN=4
+uint8 STATE_CLOSING=5
+uint8 STATE_STOPPED=6
+uint8 STATE_FAULT=7
+uint8 SOURCE_NONE=0
+uint8 SOURCE_BUTTON=1
+uint8 SOURCE_HOST=2
+uint8 SOURCE_SAFETY=3
+
+bool valid
+uint32 uptime_ms
+uint8 state
+uint8 target_command
+uint8 command_source
+uint8 io_flags
+uint16 fault_flags
+int16 current_ma
+uint16 angle_raw
+uint8 last_command_seq
+uint8 last_result
+string message

@@ -1,0 +1,5 @@
+# WebSocket support
+websockets>=12.0
+
+# OpenAI-compatible online LLM support
+openai>=1.0.0

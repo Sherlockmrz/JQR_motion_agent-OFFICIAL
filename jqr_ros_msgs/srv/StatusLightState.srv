@@ -1,0 +1,22 @@
+---
+uint8 MODE_OFF=0
+uint8 MODE_RAW=1
+uint8 MODE_SCENE=2
+uint8 EFFECT_OFF=0
+uint8 EFFECT_STEADY=1
+uint8 EFFECT_BLINK=2
+uint8 EFFECT_BREATHE=3
+
+bool valid
+uint32 uptime_ms
+uint8 last_command_seq
+uint8 control_mode
+uint8 scene
+uint8 ambient
+uint8 effect
+uint8 flags
+uint16 r_permille
+uint16 g_permille
+uint16 b_permille
+uint16 w_permille
+string message
