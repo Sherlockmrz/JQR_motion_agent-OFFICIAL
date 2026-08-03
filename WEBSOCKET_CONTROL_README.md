@@ -88,6 +88,13 @@ SmartRobotAgent (复用现有执行逻辑)
 - `find_person` - 静态找人
 - `delete_person` - 删除人脸数据
 
+`stop_move` 会同时执行三项操作：中断当前找人/找物流程、向 VLN 发送带
+`user_prompt` 的停止控制请求、向 `/cmd_vel` 发布零速度。VLN 地址默认为
+`ws://127.0.0.1:8001/ws/navigate`，可通过 `LOCAL_MODEL_URI` 覆盖。
+
+VLN 返回的每条中间 `message`/`command` 会以 `VLN推理：...` 写入 Agent
+日志，并实时广播给已连接的 WebSocket 客户端。
+
 ## 使用方法
 
 ### 方法1: 使用测试脚本
@@ -100,6 +107,25 @@ python test_websocket_control.py
 # 1 - 自动测试模式(运行预设测试用例)
 # 2 - 交互式测试模式(手动输入命令)
 ```
+
+也可以在一个 SSH 终端中启动找物，并在执行期间输入 `stop`：
+
+```bash
+python3 interactive_search_stop_client.py --task go_to_object --name 帽子
+```
+
+脚本会在同一个 WebSocket 上先发送查找任务，再发送标准停止请求：
+
+```json
+{
+  "type": "stop_move",
+  "params": {
+    "user_prompt": "停止当前找人找物任务"
+  }
+}
+```
+
+不需要打开第二个终端或创建第二个上层 WebSocket 连接。
 
 ### 方法2: 使用HTML客户端
 

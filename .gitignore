@@ -10,6 +10,8 @@ __pycache__/
 *.py[cod]
 history.db
 history.db-*
+agent_log_snapshots/
+agent_score_reports/
 
 # Local-only generated documentation and agent scratch files
 _local_docs_archive_do_not_upload/

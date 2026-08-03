@@ -93,6 +93,79 @@ BASE_YAW_MAX = math.radians(118)      # 底盘偏航最大角度
 # chassis_rotation 按底层约定解释为绝对目标角度。
 DEFAULT_SEARCH_CHASSIS_ROTATION = 0.0
 
+WAKE_ANGLE_MAX_DEGREES = 365.0
+WAKE_YAW_LIMIT_RADIANS = math.radians(150.0)
+HEAD_YAW_LIMIT_DEGREES = 150.0
+
+
+def wake_degrees_to_yaw_radians(angle_degrees: float) -> float:
+    """Convert clockwise bearing degrees to clamped motor yaw radians."""
+    normalized_degrees = angle_degrees % 360.0
+    if normalized_degrees < 180.0:
+        yaw_angle = -math.radians(normalized_degrees)
+    else:
+        yaw_angle = math.radians(360.0 - normalized_degrees)
+    return max(-WAKE_YAW_LIMIT_RADIANS, min(WAKE_YAW_LIMIT_RADIANS, yaw_angle))
+
+
+def wake_relative_degrees_to_yaw_radians(angle_degrees: float) -> float:
+    """将交互侧相对声源角转换为电机 yaw；两侧正方向相反。"""
+    return math.radians(-angle_degrees)
+
+
+def normalize_signed_degrees(angle_degrees: float) -> float:
+    """把角度归一化到 [-180, 180) 区间。"""
+    return (angle_degrees + 180.0) % 360.0 - 180.0
+
+
+def plan_wake_absolute_yaw(
+    current_motor_yaw_radians: float,
+    requested_relative_degrees: float,
+) -> Dict[str, Any]:
+    """根据实时头部位置规划位于机械限位内的绝对目标。
+
+    交互角度正数为顺时针，电机角度正方向与其相反。单次相对输入先限制为
+    ±150°。若累加目标越过机械后方但折算后回到±150°内，则返回折算后的
+    绝对目标，让控制器从零位前方转过去；折算后仍在后方禁区则不允许下发。
+    """
+    current_interaction_degrees = -math.degrees(current_motor_yaw_radians)
+    limited_relative_degrees = max(
+        -HEAD_YAW_LIMIT_DEGREES,
+        min(HEAD_YAW_LIMIT_DEGREES, requested_relative_degrees),
+    )
+    raw_target_degrees = current_interaction_degrees + limited_relative_degrees
+    target_interaction_degrees = raw_target_degrees
+    wrapped = False
+
+    if not -HEAD_YAW_LIMIT_DEGREES <= raw_target_degrees <= HEAD_YAW_LIMIT_DEGREES:
+        target_interaction_degrees = normalize_signed_degrees(raw_target_degrees)
+        wrapped = True
+
+    valid = (
+        -HEAD_YAW_LIMIT_DEGREES
+        <= target_interaction_degrees
+        <= HEAD_YAW_LIMIT_DEGREES
+    )
+    return {
+        "valid": valid,
+        "current_interaction_degrees": current_interaction_degrees,
+        "requested_relative_degrees": requested_relative_degrees,
+        "limited_relative_degrees": limited_relative_degrees,
+        "raw_target_degrees": raw_target_degrees,
+        "target_interaction_degrees": target_interaction_degrees,
+        "target_motor_radians": -math.radians(target_interaction_degrees),
+        "wrapped": wrapped,
+    }
+
+# Person/object searches can wait on VLN for a long time and must be
+# interruptible by stop_move.
+INTERRUPTIBLE_SEARCH_TASK_TYPES = frozenset({
+    "find_object",
+    "find_person",
+    "go_to_object",
+    "go_find_person",
+})
+
 # 兼容旧常量名
 HEAD_PITCH_DOWN = HEAD_PITCH_MIN
 HEAD_PITCH_UP = HEAD_PITCH_MAX
@@ -645,6 +718,10 @@ class ROS2Interface:
         self.combine_motor_control_publisher = None  # 组合电机控制发布对象
         self.four_combine_motor_control_publisher = None  # 四联组合电机控制发布对象
         self.four_combine_waypoint_control_publisher = None  # 四联多路点组合电机控制发布对象
+        self.four_motor_position_subscription = None  # 四轴实时位置反馈订阅对象
+        self.four_motor_position_lock = threading.Lock()
+        self.current_head_yaw_radians = None  # 四轴反馈第一项，电机坐标系，单位弧度
+        self.current_head_yaw_update_time = 0.0
         self.cmd_vel_publisher = None  # 底盘速度控制发布对象
         self.chassis_rotate_params_publisher = None  # 底盘旋转参数设置发布对象
         self.combine_motor_result_subscription = None  # 组合电机控制结果订阅对象（唯一结果话题 /combine_motor_control_result）
@@ -654,7 +731,7 @@ class ROS2Interface:
         self.combine_motor_monitoring_active = False  # 组合电机监控是否激活标志
         self.combine_motor_result = {}  # 组合电机执行结果 {task_id: {"result": 0-100进度 或 101/102/103/104最终}}
         self.four_combine_motor_result = {}  # 四联组合电机(单步)执行结果 {task_id: {"result": 101/102/103/104}}
-        self.four_combine_waypoint_result = {}  # 四联多路点执行结果 {task_id: {"progress": [...], "result": 101/102/103/104}}
+        self.four_combine_waypoint_result = {}  # 四联多路点最终结果 {task_id: {"result": 101/102/103/104}}
         self._motor_task_id_counter = 0  # 组合电机任务ID计数器（float32精度安全范围：1~16777215）
         self._last_motor_task_id = 0  # 上一次生成的task_id，用于去重
         self.robot_state = {
@@ -1095,17 +1172,9 @@ class ROS2Interface:
             self.four_combine_motor_result[task_id] = {"result": result}
 
             # 多路点结果字典（_wait_for_waypoint_result 读取，区分进度/最终）
-            entry = self.four_combine_waypoint_result.setdefault(
-                task_id, {"progress": [], "result": None}
-            )
+            entry = self.four_combine_waypoint_result.setdefault(task_id, {"result": None})
             if is_final:
                 entry["result"] = result
-                logger.info(f"组合电机任务 {task_id} 最终结果: {result}")
-            elif 0 <= result <= 100:
-                entry["progress"].append(result)
-                logger.info(f"组合电机任务 {task_id} 进度: {result:.1f}%")
-            else:
-                logger.info(f"组合电机任务 {task_id} 结果: {result}")
         except Exception as e:
             logger.error(f"组合电机结果回调失败: {e}")
 
@@ -1141,6 +1210,58 @@ class ROS2Interface:
         except Exception as e:
             logger.error(f"停止组合电机监控失败: {e}")
             return False
+
+    def _four_motor_position_callback(self, msg) -> None:
+        """缓存四轴反馈中的当前 yaw（data[0]，单位弧度）。"""
+        try:
+            if len(msg.data) < 1:
+                return
+            yaw_radians = float(msg.data[0])
+            if not math.isfinite(yaw_radians):
+                return
+            with self.four_motor_position_lock:
+                self.current_head_yaw_radians = yaw_radians
+                self.current_head_yaw_update_time = time.monotonic()
+        except Exception as e:
+            logger.error(f"四轴位置反馈处理失败：{e}")
+
+    def start_four_motor_position_monitoring(self) -> bool:
+        """订阅四轴位置反馈，为相对声源角规划绝对安全目标。"""
+        try:
+            if not ROS2_AVAILABLE or not self.initialized or not self.node:
+                return False
+            if self.four_motor_position_subscription is None:
+                from std_msgs.msg import Float32MultiArray
+                self.four_motor_position_subscription = self.node.create_subscription(
+                    Float32MultiArray,
+                    '/four_motor_position_feedback',
+                    self._four_motor_position_callback,
+                    10,
+                )
+                logger.info("四轴位置反馈监控已启动")
+            return True
+        except Exception as e:
+            logger.error(f"启动四轴位置反馈监控失败：{e}")
+            return False
+
+    async def _get_current_head_yaw_radians(
+        self,
+        timeout: float = 2.0,
+        max_age: float = 1.0,
+    ) -> Optional[float]:
+        """等待并返回新鲜的当前 yaw；拿不到时返回 None。"""
+        if not self.start_four_motor_position_monitoring():
+            return None
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.four_motor_position_lock:
+                yaw_radians = self.current_head_yaw_radians
+                update_time = self.current_head_yaw_update_time
+            if yaw_radians is not None and time.monotonic() - update_time <= max_age:
+                return float(yaw_radians)
+            await asyncio.sleep(0.05)
+        return None
 
     def get_robot_state(self) -> Dict[str, Any]:
         """获取机器人状态"""
@@ -1478,8 +1599,8 @@ class ROS2Interface:
                 self.four_combine_waypoint_control_publisher.publish(msg)
                 pose_str = "相对位姿" if pose_mode == 0 else "绝对位姿"
                 logger.info(
-                    f"四联多路点控制指令已发布: task_id={task_id}, "
-                    f"{pose_str}, 路点数={len(waypoints)}, 数据长度={len(data)}"
+                    f"四联多路点控制指令已发布：任务编号={task_id}，"
+                    f"{pose_str}，路点数={len(waypoints)}，数据长度={len(data)}"
                 )
                 return {"success": True}
             except Exception as e:
@@ -1589,13 +1710,12 @@ class ROS2Interface:
         """
         import asyncio
         start_time = time.time()
-        logger.info(f"[WAIT_MOTOR] 开始等待 task_id={task_id}，timeout={timeout}s")
+        logger.info(f"[等待电机] 开始等待 task_id={task_id}，timeout={timeout}s")
         check_count = 0
 
         while time.time() - start_time < timeout:
             if task_id in self.four_combine_motor_result:
                 result_value = int(self.four_combine_motor_result[task_id]["result"])
-                logger.info(f"[WAIT_MOTOR] task_id={task_id} 收到结果: result_value={result_value}")
                 if result_value == MotorResultCode.SUCCESS:
                     return {"success": True, "result": result_value}
                 elif result_value == MotorResultCode.FAILED:
@@ -1609,10 +1729,10 @@ class ROS2Interface:
             check_count += 1
             if check_count % 50 == 0:
                 elapsed = time.time() - start_time
-                logger.debug(f"[WAIT_MOTOR] task_id={task_id} 仍在等待，已检查{check_count}次，耗时{elapsed:.1f}s")
+                logger.debug(f"[等待电机] task_id={task_id} 仍在等待，已检查{check_count}次，耗时{elapsed:.1f}s")
             await asyncio.sleep(0.1)
 
-        logger.error(f"[WAIT_MOTOR] task_id={task_id} 等待超时！entry={self.four_combine_motor_result.get(task_id)}")
+        logger.error(f"[等待电机] task_id={task_id} 等待超时！entry={self.four_combine_motor_result.get(task_id)}")
         return {"success": False, "error_msg": "等待四联电机反馈超时"}
 
     async def _wait_for_waypoint_result(self, task_id: int, timeout: float = 60.0) -> Dict[str, Any]:
@@ -1624,34 +1744,33 @@ class ROS2Interface:
 
         Returns:
             Dict[str, Any]: {"success": True/False, "result": 101/102/103/104,
-                             "progress": [...], "error_msg": "..."}
+                             "error_msg": "..."}
         """
         import asyncio
         start_time = time.time()
-        logger.info(f"[WAIT] 开始等待 task_id={task_id} 的waypoint结果，timeout={timeout}s")
+        logger.info(f"[等待反馈] 开始等待任务{task_id}的多路点结果，最长等待{timeout}秒")
         check_count = 0
 
         while time.time() - start_time < timeout:
             entry = self.four_combine_waypoint_result.get(task_id)
             if entry and entry.get("result") is not None:
                 result_value = entry["result"]
-                progress = entry.get("progress", [])
-                logger.info(f"[WAIT] task_id={task_id} 收到结果: result_value={result_value}, progress={progress}")
+                logger.info(f"[等待反馈] 任务{task_id}收到最终结果码：{int(result_value)}")
                 if result_value == MotorResultCode.SUCCESS:
-                    return {"success": True, "result": result_value, "progress": progress}
+                    return {"success": True, "result": result_value}
                 elif result_value == MotorResultCode.FAILED:
-                    return {"success": False, "result": result_value, "progress": progress, "error_msg": "多路点执行失败"}
+                    return {"success": False, "result": result_value, "error_msg": "多路点执行失败"}
                 elif result_value == MotorResultCode.ABORTED:
-                    return {"success": False, "result": result_value, "progress": progress, "error_msg": "多路点执行中止"}
+                    return {"success": False, "result": result_value, "error_msg": "多路点执行中止"}
                 elif result_value == MotorResultCode.REJECTED:
-                    return {"success": False, "result": result_value, "progress": progress, "error_msg": "多路点拒绝执行"}
+                    return {"success": False, "result": result_value, "error_msg": "多路点拒绝执行"}
             check_count += 1
             if check_count % 50 == 0:
                 elapsed = time.time() - start_time
-                logger.debug(f"[WAIT] task_id={task_id} 仍在等待，已检查{check_count}次，耗时{elapsed:.1f}s，entry={entry}")
+                logger.debug(f"[等待反馈] 任务{task_id}仍在等待，已检查{check_count}次，耗时{elapsed:.1f}秒")
             await asyncio.sleep(0.1)
 
-        logger.error(f"[WAIT] task_id={task_id} 等待超时！entry={self.four_combine_waypoint_result.get(task_id)}")
+        logger.error(f"[等待反馈] 任务{task_id}等待多路点反馈超时")
         return {"success": False, "error_msg": "等待多路点反馈超时"}
 
     async def _execute_four_motor_step(self, task_id: float,
@@ -2298,22 +2417,56 @@ class ROS2Interface:
             speed_level=2
         )
 
-    async def head_reset_to_zero(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """头部回归0位
+    async def head_reset_to_zero(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """将头颈 yaw、roll、pitch 一次性回到绝对零位，底盘不参与。"""
+        params = params or {}
+        raw_speed = params.get("turn_speed", params.get("speed_level", 0))
 
-        将头部的yaw和pitch都回归到0度位置
-        """
-        import math
-        await self._pitch_activate()
-        task_id = self._next_motor_task_id()
-        return await self._execute_motor_step(
-            task_id=task_id,
-            control_pitch=True,
-            pitch_angle=math.radians(-20),
-            control_yaw=True,
-            yaw_angle=math.radians(-35),
-            speed_level=1
+        if isinstance(raw_speed, bool):
+            return {"success": False, "error_msg": "turn_speed必须是0、1或2"}
+
+        try:
+            speed_value = int(raw_speed)
+            if isinstance(raw_speed, float) and not raw_speed.is_integer():
+                raise ValueError
+            if isinstance(raw_speed, str) and str(speed_value) != raw_speed.strip():
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error_msg": "turn_speed必须是0、1或2"}
+
+        if speed_value not in (0, 1, 2):
+            return {"success": False, "error_msg": "turn_speed必须是0、1或2"}
+
+        logger.info(
+            "[头颈回零] 开始绝对回零：偏航=0，翻滚=0，俯仰=0，绝对位姿，速度档位=%s",
+            speed_value,
         )
+        result = await self.set_four_combine_waypoint_control(
+            waypoints=[{
+                "control_yaw": True,
+                "yaw_angle": 0.0,
+                "control_roll": True,
+                "roll_angle": 0.0,
+                "control_pitch": True,
+                "pitch_angle": 0.0,
+                "control_chassis_move": False,
+                "chassis_offset": 0.0,
+                "control_chassis_rotate": False,
+                "chassis_rotation": 0.0,
+                "speed_level": speed_value,
+                "timeout": 0.0,
+            }],
+            pose_mode=1,
+            timeout=30.0,
+        )
+
+        if result.get("success"):
+            logger.info("[头颈回零] 头颈绝对回零完成")
+            return {"success": True, "error_msg": ""}
+
+        error_msg = result.get("error_msg") or "头颈回零未响应"
+        logger.error("[头颈回零] %s", error_msg)
+        return {"success": False, "error_msg": error_msg}
 
     def _initialize_ros2(self):
         """初始化ROS2"""
@@ -4920,18 +5073,18 @@ class ROS2Interface:
                 "error_msg": f"四联组合电机控制异常: {str(e)}"
             }
 
-    async def wake_turn_to_person(self, angle: Any = 255,
+    async def wake_turn_to_person(self, angle: Any = 0,
                                   turn_speed: Any = 2) -> Dict[str, Any]:
         """头部按声源方向转向说话人。
 
-        ``angle`` 使用弧度，坐标约定为 0 表示机器人正前方、逆时针
-        增加；255 使用默认 45 度。当前版本只控制头部 yaw，不控制底盘。
+        ``angle`` 是声源相对当前头部的有符号度数。负数表示逆时针，正数表示顺时针。
+        使用实时四轴反馈计算安全的绝对目标，避免命令进入头颈后方机械禁区。
         """
         if isinstance(angle, bool):
             return {
                 "type": "wake_turn_to_person",
                 "success": False,
-                "error_msg": "angle必须是弧度数值或255"
+                "error_msg": "angle必须是有限度数"
             }
 
         try:
@@ -4940,7 +5093,7 @@ class ROS2Interface:
             return {
                 "type": "wake_turn_to_person",
                 "success": False,
-                "error_msg": "angle必须是弧度数值或255"
+                "error_msg": "angle必须是有限度数"
             }
 
         if not math.isfinite(angle_value):
@@ -4950,14 +5103,7 @@ class ROS2Interface:
                 "error_msg": "angle必须是有限数值"
             }
 
-        if angle_value == 255.0:
-            angle_value = math.radians(45.0)
-        elif not 0.0 <= angle_value <= 2.0 * math.pi:
-            return {
-                "type": "wake_turn_to_person",
-                "success": False,
-                "error_msg": "angle超出范围，应为0到2π弧度或255"
-            }
+        direction = "逆时针" if angle_value < 0.0 else "顺时针"
 
         if isinstance(turn_speed, bool):
             return {
@@ -4986,26 +5132,90 @@ class ROS2Interface:
                 "error_msg": "turn_speed必须是0、1或2"
             }
 
+        current_motor_yaw = await self._get_current_head_yaw_radians()
+        if current_motor_yaw is None:
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "未收到有效的四轴位置反馈，无法安全计算转向目标",
+            }
+
+        plan = plan_wake_absolute_yaw(current_motor_yaw, angle_value)
+        if not plan["valid"]:
+            logger.warning(
+                "[唤醒转向] 本次不执行：当前位置=%.1f°，有效相对角=%.1f°，"
+                "折算目标=%.1f°，目标仍在头颈后方禁区",
+                plan["current_interaction_degrees"],
+                plan["limited_relative_degrees"],
+                plan["target_interaction_degrees"],
+            )
+            return {
+                "type": "wake_turn_to_person",
+                "success": False,
+                "error_msg": "继续同方向转动仍会进入头颈后方禁区，本次未下发",
+            }
+
+        target_motor_yaw = float(plan["target_motor_radians"])
+        if plan["limited_relative_degrees"] != angle_value:
+            logger.info(
+                "[唤醒转向] 输入相对角%.1f°超过单次±150°限制，按%.1f°执行",
+                angle_value,
+                plan["limited_relative_degrees"],
+            )
+
         logger.info(
-            f"[WAKE_TURN_TO_PERSON] 开始转向说话人: "
-            f"angle={angle_value:.4f}rad, turn_speed={speed_value}"
-        )
-        result = await self.set_four_combine_motor_control(
-            control_yaw=True,
-            yaw_angle=angle_value,
-            speed_level=speed_value
+            "[唤醒转向] 规划完成：当前位置=%.1f°，输入相对角=%.1f°（%s），"
+            "有效相对角=%.1f°，绝对目标=%.1f°，速度档位=%s",
+            plan["current_interaction_degrees"],
+            angle_value,
+            direction,
+            plan["limited_relative_degrees"],
+            plan["target_interaction_degrees"],
+            speed_value,
         )
 
+        def wake_yaw_waypoint(target_yaw: float) -> Dict[str, Any]:
+            return {
+                "control_yaw": True,
+                "yaw_angle": float(target_yaw),
+                "control_roll": False,
+                "roll_angle": 0.0,
+                "control_pitch": False,
+                "pitch_angle": 0.0,
+                "control_chassis_move": False,
+                "chassis_offset": 0.0,
+                "control_chassis_rotate": False,
+                "chassis_rotation": 0.0,
+                "speed_level": speed_value,
+                "timeout": 0.0,
+            }
+
+        async def execute_wake_yaw(target_yaw: float) -> Dict[str, Any]:
+            logger.info(
+                "[唤醒转向] 发布多路点绝对位姿命令：路点数=1，"
+                "数据长度=15，电机绝对偏航=%.1f°/%.4f弧度",
+                math.degrees(target_yaw),
+                target_yaw,
+            )
+            return await self.set_four_combine_waypoint_control(
+                waypoints=[wake_yaw_waypoint(target_yaw)],
+                pose_mode=1,
+                timeout=30.0,
+            )
+
+        result = await execute_wake_yaw(target_motor_yaw)
+
         if result.get("success"):
-            logger.info("[WAKE_TURN_TO_PERSON] 头部转向完成")
+            logger.info("[唤醒转向] 头部转向完成")
             return {
                 "type": "wake_turn_to_person",
                 "success": True,
-                "error_msg": ""
+                "error_msg": "",
+                "_final_head_angle_degrees": plan["target_interaction_degrees"],
             }
 
         error_msg = result.get("error_msg") or "未响应"
-        logger.error(f"[WAKE_TURN_TO_PERSON] {error_msg}")
+        logger.error(f"[唤醒转向] {error_msg}")
         return {
             "type": "wake_turn_to_person",
             "success": False,
@@ -5123,51 +5333,55 @@ class ROS2Interface:
             timeout (float): 等待全部路点反馈的总超时（秒）
 
         Returns:
-            Dict[str, Any]: 控制结果 {"success": bool, "result": int, "progress": [...], "task_id": int}
+            Dict[str, Any]: 控制结果 {"success": bool, "result": int, "task_id": int}
         """
-        logger.info(f"[WAYPOINT_CTRL] 开始 | waypoints数={len(waypoints) if waypoints else 0}, pose_mode={pose_mode}, timeout={timeout}")
+        logger.info(
+            f"[多路点控制] 开始：路点数={len(waypoints) if waypoints else 0}，"
+            f"位姿模式={pose_mode}，最长等待={timeout}秒"
+        )
         try:
             if not waypoints or len(waypoints) < 1:
                 return {"success": False, "error_msg": "路点数量必须 >= 1"}
 
-            logger.info(f"[WAYPOINT_CTRL] 启动 monitoring...")
+            logger.info("[多路点控制] 启动结果监控")
             # 多路点结果走唯一的 /combine_motor_control_result 话题
             self.start_combine_motor_monitoring()
 
             task_id = self._next_motor_task_id()
-            logger.info(f"[WAYPOINT_CTRL] task_id={task_id}")
+            logger.info(f"[多路点控制] 任务编号={task_id}")
             # 清除旧的结果缓存
             self.four_combine_waypoint_result.pop(int(task_id), None)
 
             # 发布多路点指令
-            logger.info(f"[WAYPOINT_CTRL] 发布指令...")
+            logger.info("[多路点控制] 发布指令")
             pub_result = self.publish_four_combine_waypoint_control(
                 task_id=task_id, waypoints=waypoints, pose_mode=int(pose_mode)
             )
             if not pub_result["success"]:
-                logger.error(f"[WAYPOINT_CTRL] 发布失败: {pub_result}")
+                logger.error(f"[多路点控制] 发布失败：{pub_result.get('error_msg', '未知错误')}")
                 return pub_result
 
             # 等待反馈
-            logger.info(f"[WAYPOINT_CTRL] 等待反馈 task_id={task_id}...")
+            logger.info(f"[多路点控制] 等待任务{task_id}反馈")
             result = await self._wait_for_waypoint_result(int(task_id), timeout=float(timeout))
-            logger.info(f"[WAYPOINT_CTRL] 等待完成，result={result}")
 
             if result.get("success"):
                 logger.info(
-                    f"四联多路点控制成功 | task_id={task_id} | "
-                    f"pose_mode={pose_mode} | 路点数={len(waypoints)} | "
-                    f"progress={result.get('progress', [])}"
+                    f"[多路点控制] 执行成功：任务编号={task_id}，"
+                    f"位姿模式={pose_mode}，路点数={len(waypoints)}"
                 )
             else:
-                logger.error(f"四联多路点控制失败: {result.get('error_msg', '未知错误')}")
+                logger.error(f"[多路点控制] 执行失败：{result.get('error_msg', '未知错误')}")
 
             result["task_id"] = int(task_id)
-            logger.info(f"[WAYPOINT_CTRL] 返回 result={result}")
+            if result.get("success"):
+                logger.info("[多路点控制] 返回成功")
+            else:
+                logger.info("[多路点控制] 返回失败")
             return result
 
         except Exception as e:
-            logger.error(f"[WAYPOINT_CTRL] 异常: {e}")
+            logger.error(f"[多路点控制] 发生异常：{e}")
             import traceback
             traceback.print_exc()
             return {
@@ -5578,17 +5792,15 @@ class SmartRobotAgent:
             "emergency_stop", "keyboard_motor_control"
         }
 
-    def _mark_wake_turn_context(self, angle: Any = 255) -> None:
+    def _mark_wake_turn_context(self, angle: Any = 0) -> None:
         """记录成功的wake及其实际角度，供下一次动态搜索消费。"""
-        angle_value = float(angle)
-        if angle_value == 255.0:
-            angle_value = math.radians(45.0)
+        angle_value = wake_degrees_to_yaw_radians(float(angle))
 
         with self._wake_turn_context_lock:
             self._wake_turn_completed_at = True
             self._wake_turn_angle = angle_value
         logger.info(
-            "[SEARCH_POSE] wake_turn_to_person成功，场景A标记已设置："
+            "[搜索姿态] wake_turn_to_person成功，场景A标记已设置："
             "底盘将使用wake角度%.6frad（%.1f°）",
             angle_value,
             math.degrees(angle_value),
@@ -5607,7 +5819,7 @@ class SmartRobotAgent:
             return False, DEFAULT_SEARCH_CHASSIS_ROTATION
 
         logger.info(
-            "[SEARCH_POSE] 消费wake_turn_to_person场景A标记，使用wake角度%.6frad（%.1f°）",
+            "[搜索姿态] 消费wake_turn_to_person场景A标记，使用wake角度%.6frad（%.1f°）",
             wake_angle,
             math.degrees(wake_angle),
         )
@@ -5619,7 +5831,7 @@ class SmartRobotAgent:
         scene = "A" if after_wake_turn else "B"
         chassis_rotation = wake_angle if after_wake_turn else DEFAULT_SEARCH_CHASSIS_ROTATION
         logger.info(
-            "[SEARCH_POSE] %s开始前执行场景%s归零：头部yaw/roll/pitch=0，"
+            "[搜索姿态] %s开始前执行场景%s归零：头部yaw/roll/pitch=0，"
             "底盘绝对目标角=%.6frad（%.1f°）",
             task_type,
             scene,
@@ -5641,7 +5853,7 @@ class SmartRobotAgent:
             )
         except Exception as exc:
             logger.error(
-                "[SEARCH_POSE] 场景%s归零发生异常，但按策略继续执行%s：%s",
+                "[搜索姿态] 场景%s归零发生异常，但按策略继续执行%s：%s",
                 scene,
                 task_type,
                 exc,
@@ -5649,10 +5861,10 @@ class SmartRobotAgent:
             return {"success": False, "error_msg": str(exc), "scene": scene}
 
         if result.get("success"):
-            logger.info("[SEARCH_POSE] 场景%s归零完成，继续执行%s", scene, task_type)
+            logger.info("[搜索姿态] 场景%s归零完成，继续执行%s", scene, task_type)
         else:
             logger.error(
-                "[SEARCH_POSE] 场景%s归零失败，但按策略继续执行%s：%s",
+                "[搜索姿态] 场景%s归零失败，但按策略继续执行%s：%s",
                 scene,
                 task_type,
                 result.get("error_msg") or f"result={result.get('result', '未知')}",
@@ -6025,7 +6237,10 @@ Agent已知的能力（可用工具）:
                 "设置文档定义的状态灯scene，默认ambient=day、restart_pattern=true并回读验证"
             ),
             "get_status_light_state": "查询MCU实际执行的状态灯场景、效果、flags和RGBW诊断快照",
-            "wake_turn_to_person": "头部按声源方向转向说话人（angle单位为弧度）",
+            "wake_turn_to_person": (
+                "头部按声源相对当前头部的方向转向说话人（angle单位为度；"
+                "负数逆时针，正数顺时针；结合实时头部位置规划±150度内的绝对安全目标）"
+            ),
             "forward_head": "头部前倾关切（angle单位为弧度，255默认15度）",
             "get_robot_rise_state": "获取机器人升降状态",
             "set_robot_rise_jqr": "控制机器人升降",
@@ -6044,6 +6259,10 @@ Agent已知的能力（可用工具）:
                 "可选 speed_deg_s/speed_level/timeout；angle_unit 默认 deg，可传 rad"
             ),
             "head_sweep_sequence": "兼容旧版头颈三轴序列控制，等价于 four_dof_head_sequence",
+            "head_reset_to_zero": (
+                "将头颈yaw、roll、pitch通过绝对位姿模式一次性回到0，底盘不参与；"
+                "可选turn_speed=0/1/2，默认低速0"
+            ),
             "set_four_combine_waypoint_control": (
                 "头颈三轴(yaw/roll/pitch)+底盘(位移/旋转)多路点组合运控(仅位置模式)。"
                 "params 需含 waypoints(路点列表，每个路点支持 control_yaw/yaw_angle/"
@@ -6283,10 +6502,11 @@ Agent已知的能力（可用工具）:
         """
         task_type = task.get("type")
         task_params = task.get("params", {})
+        navigation_task_id = None
 
         if not task_type:
             return {"type": task_type or "unknown", "success": False, "error_msg": "任务类型为空"}
-        
+
         # 检查任务类型并发控制（仅串口模式下）
         has_lock = False
         if self.usb_manager.serial_manager:
@@ -6298,6 +6518,13 @@ Agent已知的能力（可用工具）:
                     "error_msg": error_msg
                 }
             has_lock = True
+
+        if task_type in INTERRUPTIBLE_SEARCH_TASK_TYPES:
+            self._task_interrupted = False
+            navigation_task_id = f"{task_type}:{id(asyncio.current_task())}"
+            async with self.task_execution_lock:
+                self.active_navigation_tasks.add(navigation_task_id)
+            logger.info("[搜索任务] 已登记可中断任务: %s", navigation_task_id)
 
         try:
             # 直接使用params中的参数，通过_execute_task_by_type执行
@@ -6317,6 +6544,11 @@ Agent已知的能力（可用工具）:
                 "error_msg": f"执行任务时出错: {str(e)}"
             }
         finally:
+            if navigation_task_id is not None:
+                async with self.task_execution_lock:
+                    self.active_navigation_tasks.discard(navigation_task_id)
+                logger.info("[搜索任务] 已移除任务: %s", navigation_task_id)
+
             # 任务执行完成，释放任务类型锁
             if has_lock:
                 self.usb_manager.serial_manager.release_task_type_lock(task_type)
@@ -6418,8 +6650,10 @@ Agent已知的能力（可用工具）:
             return stop_follow()
         elif task_type == "stop_navigate":
             return stop_navigate()
-        elif task_type == "stop_move" and hasattr(self, 'ros2_interface'):
-            result = await self.stop_move()
+        elif task_type == "stop_move":
+            result = await self.stop_move(
+                params.get("user_prompt", "停止当前找人找物任务")
+            )
             result["type"] = task_type
             return result
         elif task_type == "pause_move":
@@ -6470,7 +6704,11 @@ Agent已知的能力（可用工具）:
         elif task_type == "wake_turn_to_person" and hasattr(self, 'ros2_interface'):
             result = await self.ros2_interface.wake_turn_to_person(**params)
             if result.get("success"):
-                self._mark_wake_turn_context(params.get("angle", 255))
+                final_angle = result.pop(
+                    "_final_head_angle_degrees",
+                    params.get("angle", 0),
+                )
+                self._mark_wake_turn_context(final_angle)
             result["type"] = task_type
             return result
         elif task_type == "forward_head" and hasattr(self, 'ros2_interface'):
@@ -6725,6 +6963,9 @@ Agent已知的能力（可用工具）:
         """
         logger.info(f"开始查找：{obj_name}（用户指令：{user_prompt}）")
 
+        if getattr(self, "_task_interrupted", False):
+            return self._interrupted_search_result("find_object")
+
         # 存储初始查询结果
         initial_find_result = None
         try:
@@ -6771,6 +7012,8 @@ Agent已知的能力（可用工具）:
 
             # Step 4: 使用LLM对user_prompt进行任务拆解并执行
             if user_prompt:
+                if getattr(self, "_task_interrupted", False):
+                    return self._interrupted_search_result("find_object")
                 logger.info(f"因带用户指令，开始用 LLM 拆解任务：{user_prompt}")
                 task_list = await self._decompose_find_object_task(user_prompt)
                 success_count = 0
@@ -6779,11 +7022,15 @@ Agent已知的能力（可用工具）:
                     logger.info(f"LLM 拆出 {len(task_list)} 个子任务，开始执行")
                     # 依次执行所有go_to_object任务
                     for task in task_list:
+                        if getattr(self, "_task_interrupted", False):
+                            return self._interrupted_search_result("find_object")
                         if task.get("type") == "go_to_object":
                             task_params = task.get("params", {})
                             obj_name_sub = task_params.get("obj_name", obj_name)
                             logger.info(f"执行子任务: go_to_object {obj_name_sub}")
                             response = await self.go_to_object(obj_name_sub, task_params.get("pixel_position"))
+                            if getattr(self, "_task_interrupted", False):
+                                return self._interrupted_search_result("find_object")
                             if (response.get("success") == True):
                                 success_count += 1
                             await self.send_response_to_client(response)
@@ -6812,7 +7059,12 @@ Agent已知的能力（可用工具）:
     async def go_to_object(self, obj_name: str, pixel_position: Optional[List[float]] = None) -> Dict[str, Any]:
         """导航到物体位置"""
         try:
+            if getattr(self, "_task_interrupted", False):
+                return self._interrupted_search_result("go_to_object")
             await self._reset_dynamic_search_pose("go_to_object")
+
+            if getattr(self, "_task_interrupted", False):
+                return self._interrupted_search_result("go_to_object")
 
             # 构造符合导航服务期望的数据格式
             model_data = {
@@ -6832,6 +7084,9 @@ Agent已知的能力（可用工具）:
             }
 
             response = await self.send_to_local_model(model_data)
+
+            if getattr(self, "_task_interrupted", False):
+                return self._interrupted_search_result("go_to_object")
 
             if response and response.get("error_msg") == "无法连接到本地模型服务器":
                 result_msg["err_msg"] = "无法连接到本地模型服务器"
@@ -6914,7 +7169,12 @@ Agent已知的能力（可用工具）:
     async def go_find_person(self, obj_name: str, user_prompt: str, **kwargs) -> Dict[str, Any]:
         """查找人员"""
         try:
+            if getattr(self, "_task_interrupted", False):
+                return self._interrupted_search_result("go_find_person")
             await self._reset_dynamic_search_pose("go_find_person")
+
+            if getattr(self, "_task_interrupted", False):
+                return self._interrupted_search_result("go_find_person")
 
             model_data = {
                 "type": "go_to_person",
@@ -6926,6 +7186,8 @@ Agent已知的能力（可用工具）:
                         "success": False,
                         "err_msg": ""}
             response = await self.send_to_local_model(model_data)
+            if getattr(self, "_task_interrupted", False):
+                return self._interrupted_search_result("go_find_person")
             if response and response.get("error_msg") == "无法连接到本地模型服务器":
                 result_msg = {
                         "type": "go_find_person",
@@ -6945,84 +7207,122 @@ Agent已知的能力（可用工具）:
             }
             return result_msg
 
-    async def stop_move(self) -> Dict[str, Any]:
-        """
-        停止机器人移动
-        
-        Returns:
-            Dict[str, Any]: 停止移动结果
-        """
+    def _interrupted_search_result(self, task_type: str) -> Dict[str, Any]:
+        """构造找人找物任务被 stop_move 中断后的统一结果。"""
+        logger.warning("[搜索任务] %s 已被 stop_move 中断", task_type)
+        return {
+            "type": task_type,
+            "success": False,
+            "interrupted": True,
+            "error_msg": "任务已被 stop_move 中断",
+        }
+
+    async def _publish_chassis_zero_velocity(self) -> tuple[bool, str]:
+        """向底盘发布一次零速度，返回执行状态和错误信息。"""
+        if not ROS2_AVAILABLE:
+            logger.warning("[停止底盘] ROS2不可用，未发送底盘零速度命令")
+            return False, ""
+
         try:
-            logger.info("[STOP_MOVE] 开始停止机器人移动")
-            
-            # 1. 检查当前是否有本地模型导航任务在执行，如果有，停止模型任务
-            if self.has_active_navigation_tasks():
-                try:
-                    # 发送停止命令到本地模型
-                    stop_data = {
-                        "type": "stop"
-                    }
-                    response = await self.send_to_local_model(stop_data)
-                    if response and (response.get("success") == False) :
-                        return {
-                            "type": "stop_move",
-                            "success": False,
-                            "error_msg": response.get("error_msg")
-                        }
-                    # 清空活跃任务集合
-                    async with self.task_execution_lock:
-                        self.active_navigation_tasks.clear()
+            cmd = "ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'"
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if completed.returncode == 0:
+                return True, ""
+            return False, completed.stderr.strip() or "发布底盘零速度命令失败"
+        except Exception as exc:
+            return False, f"发布底盘零速度命令失败: {exc}"
 
-                except Exception as e:
-                    logger.warning(f"[STOP_MOVE] 发送停止命令到本地模型失败: {e}")
-            else:
-                logger.info("[STOP_MOVE] 当前没有活跃的导航任务")
-            
-            # 2. 在/cmd_vel话题上发一次0
-            if ROS2_AVAILABLE:
-                try:
-                    # 使用subprocess.run替代os.system，避免阻塞并获取返回状态
-                    cmd = "ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'"
-                    subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+    async def _stop_timed_out_vln_task(self) -> Dict[str, Any]:
+        """VLN 总体超时时同时取消下游任务并停止底盘。"""
+        vln_task = asyncio.create_task(
+            self._send_control_to_local_model({
+                "type": "stop",
+                "user_prompt": "Agent等待VLN最终结果超时，停止当前任务",
+            })
+        )
+        chassis_task = asyncio.create_task(self._publish_chassis_zero_velocity())
+        vln_response, (chassis_stopped, chassis_error) = await asyncio.gather(
+            vln_task, chassis_task
+        )
+        vln_stopped = bool(
+            isinstance(vln_response, dict)
+            and (
+                vln_response.get("success") is True
+                or vln_response.get("result") is True
+            )
+        )
+        result = {
+            "vln_stopped": vln_stopped,
+            "chassis_stopped": chassis_stopped,
+            "vln_response": vln_response,
+            "chassis_error": chassis_error,
+        }
+        logger.info("[VLN超时停止] 自动停止结果: %s", result)
+        return result
 
-                    result_data = {
-                        "type": "stop_move",
-                        "success": True,
-                    }
-                    return result_data
-                    
-                except Exception as e:
-                    error_msg = f"发布速度命令失败: {str(e)}"
-                    logger.error(f"[STOP_MOVE] {error_msg}")
-                    
-                    result_data = {
-                        "type": "stop_move",
-                        "success": False,
-                        "result": error_msg
-                    }
-                    return result_data
-            else:
-                # ROS2不可用时无法停止移动
-                error_msg = "ROS2不可用，无法停止机器人移动"
-                logger.error(f"[STOP_MOVE] {error_msg}")
-                
-                result_data = {
-                    "type": "stop_move",
-                    "success": False,
-                    "result": error_msg
-                }
-                return result_data
-                
-        except Exception as e:
-            error_msg = f"停止移动失败: {str(e)}"
-            logger.error(f"[STOP_MOVE] {error_msg}")
-            
-            result_data = {
-                "type": "stop_move",
-                "success": False,
-                "result": error_msg
-            }
-            return result_data    
+    async def stop_move(
+        self, user_prompt: str = "停止当前找人找物任务"
+    ) -> Dict[str, Any]:
+        """停止底盘，并终止所有正在执行的找人找物流程。"""
+        logger.info("[STOP_MOVE] 开始停止机器人移动及找人找物流程")
+
+        had_active_task = self.has_active_navigation_tasks()
+        self._task_interrupted = True
+        async with self.task_execution_lock:
+            self.active_navigation_tasks.clear()
+
+        # Start the VLN stop request immediately; chassis zero-speed publishing
+        # and VLN cancellation can proceed at the same time.
+        vln_stop_task = asyncio.create_task(
+            self._send_control_to_local_model({
+                "type": "stop",
+                "user_prompt": user_prompt,
+            })
+        )
+
+        chassis_stopped, chassis_error = await self._publish_chassis_zero_velocity()
+        if chassis_error:
+            logger.error("[STOP_MOVE] %s", chassis_error)
+
+        # 导航请求正在普通连接上等待 recv()；控制命令必须使用独立连接，
+        # 避免两个协程同时读取同一个 WebSocket。
+        vln_response = await vln_stop_task
+        vln_stopped = bool(
+            isinstance(vln_response, dict)
+            and (
+                vln_response.get("success") is True
+                or vln_response.get("result") is True
+            )
+        )
+        vln_error = ""
+        if not vln_stopped:
+            vln_error = (
+                vln_response.get("error_msg", "VLN未确认停止")
+                if isinstance(vln_response, dict)
+                else "VLN未确认停止"
+            )
+            logger.warning("[STOP_MOVE] %s", vln_error)
+
+        success = vln_stopped and (chassis_stopped or not ROS2_AVAILABLE)
+        error_parts = [part for part in (vln_error, chassis_error) if part]
+        result = {
+            "type": "stop_move",
+            "success": success,
+            "interrupted": True,
+            "had_active_task": had_active_task,
+            "vln_stopped": vln_stopped,
+            "chassis_stopped": chassis_stopped,
+            "error_msg": "; ".join(error_parts) if not success else "",
+        }
+        logger.info("[STOP_MOVE] 停止结果: %s", result)
+        return result
 
     async def pause_move(self) -> Dict[str, Any]:
         """暂停当前 VLN 导航任务，沿用 stop_move 的本地模型通信链路。"""
@@ -7238,6 +7538,41 @@ Agent已知的能力（可用工具）:
             logger.error(f"建立线程本地连接失败: {e}")
             thread_local.websocket = None
             return False
+
+    async def _send_control_to_local_model(
+        self, control_data: Dict[str, Any], timeout: float = 10.0
+    ) -> Dict[str, Any]:
+        """通过独立连接发送 VLN 控制命令，避免干扰正在接收的导航连接。"""
+        import websockets
+
+        try:
+            connect_func = getattr(websockets, "connect")
+            async with connect_func(
+                self.local_model_uri,
+                ping_interval=None,
+                ping_timeout=None,
+                open_timeout=5.0,
+                close_timeout=5.0,
+            ) as websocket:
+                await websocket.send(json.dumps(control_data, ensure_ascii=False))
+                logger.info("[VLN_CONTROL] 已发送控制命令: %s", control_data.get("type"))
+
+                deadline = asyncio.get_running_loop().time() + timeout
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+
+                    response_str = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    response_data = json.loads(response_str)
+                    logger.info("[VLN_CONTROL] 收到响应: %s", response_data)
+                    if any(key in response_data for key in ("success", "result", "answer", "error_msg")):
+                        return response_data
+        except asyncio.TimeoutError:
+            return {"success": False, "error_msg": f"VLN控制命令等待确认超时 ({timeout:.0f}s)"}
+        except Exception as exc:
+            logger.error("[VLN_CONTROL] 控制命令发送失败: %s", exc)
+            return {"success": False, "error_msg": f"VLN控制命令发送失败: {exc}"}
     
     async def send_to_local_model(self, model_data: Dict[str, Any], task_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -7296,19 +7631,45 @@ Agent已知的能力（可用工具）:
                 "command": ""
             }
             
-            # 持续接收响应，直到收到最终结果（总体超时120秒）
+            # 持续接收响应，直到收到最终结果。只要 VLN 持续返回推理消息，
+            # 长时间搜索就不应被固定的短总时长误判为超时。
             final_response = None
             overall_start_time = time.time()
-            OVERALL_TIMEOUT = 120.0  # 总体超时120秒
+            last_response_time = overall_start_time
+            RESPONSE_IDLE_TIMEOUT = 120.0
+            OVERALL_TIMEOUT = 900.0
             while self._running and websocket is not None:
                 try:
-                    # 检查总体超时
-                    if time.time() - overall_start_time > OVERALL_TIMEOUT:
-                        logger.error(f"接收本地模型响应总体超时 ({OVERALL_TIMEOUT}s)")
-                        final_response = {"success": False, "error_msg": f"等待模型响应超时 ({OVERALL_TIMEOUT}s)"}
+                    now = time.time()
+                    overall_elapsed = now - overall_start_time
+                    response_idle = now - last_response_time
+                    if (
+                        response_idle > RESPONSE_IDLE_TIMEOUT
+                        or overall_elapsed > OVERALL_TIMEOUT
+                    ):
+                        if response_idle > RESPONSE_IDLE_TIMEOUT:
+                            timeout_reason = (
+                                f"连续 {RESPONSE_IDLE_TIMEOUT:.0f} 秒未收到VLN响应"
+                            )
+                        else:
+                            timeout_reason = (
+                                f"VLN任务超过最长 {OVERALL_TIMEOUT:.0f} 秒"
+                            )
+                        logger.error("%s，开始自动停止下游任务", timeout_reason)
+                        await self._stop_timed_out_vln_task()
+                        try:
+                            await websocket.close()
+                        except Exception:
+                            pass
+                        thread_local.websocket = None
+                        final_response = {
+                            "success": False,
+                            "error_msg": timeout_reason,
+                        }
                         break
 
                     response_str = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    last_response_time = time.time()
                     try:
                         response_data = json.loads(response_str)
                     except json.JSONDecodeError as e:
@@ -7329,7 +7690,15 @@ Agent已知的能力（可用工具）:
                             intermediate_data["command"] = response_data.get("message", "") 
                         else:
                             intermediate_data["command"] = response_data.get("command", "")
+                        logger.info("VLN推理：%s", intermediate_data["command"])
                         await self.usb_manager.send_message(intermediate_data)
+                        # USB启用时 send_message 只发串口，需要额外把同一条推理
+                        # 广播给连接到 8766 的交互客户端。
+                        if (
+                            getattr(self.usb_manager, "serial_enabled", False)
+                            and hasattr(self, "websocket_server")
+                        ):
+                            await self.websocket_server.broadcast_message(intermediate_data)
                 except asyncio.TimeoutError:
                     # 超时检查运行状态
                     continue

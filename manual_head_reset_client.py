@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""通过上层 WebSocket 协议手动测试 wake_turn_to_person。"""
+"""通过上层 WebSocket 协议手动测试 head_reset_to_zero。"""
 
 import argparse
 import asyncio
@@ -8,11 +8,10 @@ import json
 import websockets
 
 
-async def main(uri: str, angle: float, turn_speed: int) -> None:
+async def main(uri: str, turn_speed: int) -> None:
     request = {
-        "type": "wake_turn_to_person",
+        "type": "head_reset_to_zero",
         "params": {
-            "angle": angle,
             "turn_speed": turn_speed,
         },
     }
@@ -24,15 +23,8 @@ async def main(uri: str, angle: float, turn_speed: int) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "angle",
-        type=float,
-        help=(
-            "声源相对当前头部的角度，单位为度；负数逆时针，正数顺时针"
-        ),
-    )
-    parser.add_argument("--turn-speed", type=int, choices=[0, 1, 2], default=2)
+    parser = argparse.ArgumentParser(description="让头颈yaw/roll/pitch绝对回到零位")
+    parser.add_argument("--turn-speed", type=int, choices=[0, 1, 2], default=0)
     parser.add_argument("--uri", default="ws://127.0.0.1:8766")
     args = parser.parse_args()
-    asyncio.run(main(args.uri, args.angle, args.turn_speed))
+    asyncio.run(main(args.uri, args.turn_speed))

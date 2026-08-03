@@ -143,9 +143,6 @@ python3 test_four_waypoint_control.py --case single
 # 运行全部测试用例
 python3 test_four_waypoint_control.py --case all
 
-# 集成测试（自动启动 mock 节点）
-./test_waypoint_integration.sh
-./test_waypoint_integration.sh --case multi
 ```
 
 ## 应用场景示例
@@ -283,5 +280,4 @@ waypoints = [
 
 - `mock_four_waypoint_node.py` - 模拟电机控制节点
 - `test_four_waypoint_control.py` - 端到端测试脚本
-- `test_waypoint_integration.sh` - 集成测试脚本
 - `smart_robot_agent.py` - Agent 集成实现（第1126-1197行：监控，第1373-1486行：发布和等待，第3996-4065行：高层接口）

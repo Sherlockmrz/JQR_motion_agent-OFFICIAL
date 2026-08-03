@@ -40,7 +40,7 @@ class AgentConfig:
 
     LOCAL_MODEL_URI: str = field(
         default_factory=lambda: os.getenv(
-            "LOCAL_MODEL_URI", "ws://127.0.0.1:8000/ws/navigate"
+            "LOCAL_MODEL_URI", "ws://127.0.0.1:8001/ws/navigate"
         )
     )
 

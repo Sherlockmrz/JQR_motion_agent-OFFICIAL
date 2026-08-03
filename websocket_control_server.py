@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """WebSocket控制服务器 - 支持局域网终端控制"""
 import asyncio
+import contextvars
+import itertools
 import json
 import logging
 import threading
@@ -10,13 +12,31 @@ from typing import Dict, Any, Optional
 import websockets
 
 logger = logging.getLogger(__name__)
+_TRACE_SEQUENCE = itertools.count(1)
 
 # ============ 统一日志格式支撑：[trace=..][时间][标签] 内容 ============
-# 当前任务上下文（机器人单任务串行，用全局即可）。WS 入口在连接/收命令时更新它，
-# filter 会把 trace/label 注入到每一条日志记录里，从而所有模块的日志都带同样前缀。
+# 当前任务上下文。ContextVar 让同一线程内并发执行的找物与 stop_move
+# 各自保留 trace/label，filter 再把它们注入每一条日志记录。
 class _LogContext:
-    trace = "-"
-    label = "系统"
+    def __init__(self):
+        self._trace = contextvars.ContextVar("motion_agent_trace", default="-")
+        self._label = contextvars.ContextVar("motion_agent_label", default="系统")
+
+    @property
+    def trace(self):
+        return self._trace.get()
+
+    @trace.setter
+    def trace(self, value):
+        self._trace.set(value)
+
+    @property
+    def label(self):
+        return self._label.get()
+
+    @label.setter
+    def label(self, value):
+        self._label.set(value)
 
 
 log_context = _LogContext()
@@ -104,8 +124,9 @@ def _params_for_log(params: Dict[str, Any]) -> str:
 
 
 def _make_trace() -> str:
-    """任务追踪号：连接建立时刻，格式 YYYYMMDD-HHMMSS。"""
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    """生成毫秒级任务追踪号，确保同一连接内的并发命令互不混淆。"""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    return f"{timestamp}-{next(_TRACE_SEQUENCE):06d}"
 
 
 class WebSocketControlServer:
@@ -214,7 +235,8 @@ class WebSocketControlServer:
         """
         client_addr = websocket.remote_address
         _ip = f"{client_addr[0]}:{client_addr[1]}" if client_addr else "未知"
-        # 新会话：设置 trace 上下文（命令到达前标签为“连接”）
+        # 连接日志使用连接建立时的 trace；每条消息会在 _handle_message 中
+        # 生成自己的任务 trace。
         log_context.trace = _make_trace()
         log_context.label = "连接"
         logger.info("WebSocket 连接已打开，等待上层任务")
@@ -226,18 +248,13 @@ class WebSocketControlServer:
         
         try:
             # 持续接收消息
+            message_tasks = set()
             async for message in websocket:
-                try:
-                    await self._handle_message(websocket, message)
-                except Exception as e:
-                    logger.error(f"处理消息异常: {e}")
-                    self.total_errors += 1
-                    # 发送错误响应
-                    error_response = {
-                        "success": False,
-                        "error_msg": f"处理消息失败: {str(e)}"
-                    }
-                    await websocket.send(json.dumps(error_response, ensure_ascii=False))
+                # 长时间运行的找人/找物不能阻塞同一连接上的 stop_move。
+                # 每条消息使用独立任务处理，响应仍返回到原 WebSocket。
+                task = asyncio.create_task(self._handle_message(websocket, message))
+                message_tasks.add(task)
+                task.add_done_callback(message_tasks.discard)
         
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"客户端 {_ip} 已断开连接，本次会话结束")
@@ -257,6 +274,8 @@ class WebSocketControlServer:
         """
         self.total_messages += 1
         start_time = time.time()
+        log_context.trace = _make_trace()
+        log_context.label = "任务"
         
         try:
             # 解析消息
@@ -292,7 +311,7 @@ class WebSocketControlServer:
             task_type = data.get("type")
             task_params = data.get("params", {})
 
-            # ===== 更新日志上下文：标签切换成任务类型（trace 沿用连接时的） =====
+            # ===== 更新日志上下文：标签切换成任务类型，trace 为本条消息独有 =====
             log_context.label = TYPE_LABEL.get(task_type, task_type or "任务")
             obj_name = task_params.get("obj_name", "")
             user_prompt = task_params.get("user_prompt", "")
@@ -361,7 +380,15 @@ class WebSocketControlServer:
                 }
 
                 # 如果有额外的数据字段，也添加到响应中
-                for key in ["result", "description", "data"]:
+                for key in [
+                    "result",
+                    "description",
+                    "data",
+                    "interrupted",
+                    "had_active_task",
+                    "vln_stopped",
+                    "chassis_stopped",
+                ]:
                     if key in result:
                         response[key] = result[key]
 

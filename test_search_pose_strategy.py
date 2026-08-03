@@ -28,9 +28,9 @@ def make_agent() -> SmartRobotAgent:
 
 
 class SearchPoseSelectionTest(unittest.IsolatedAsyncioTestCase):
-    async def test_wake_uses_scene_a_and_the_same_input_angle(self):
+    async def test_wake_uses_scene_a_and_converted_angle(self):
         agent = make_agent()
-        agent._mark_wake_turn_context(math.pi / 2)
+        agent._mark_wake_turn_context(90)
 
         result = await agent._reset_dynamic_search_pose("go_find_person")
 
@@ -43,19 +43,19 @@ class SearchPoseSelectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kwargs["control_pitch"])
         self.assertEqual(kwargs["pitch_angle"], 0.0)
         self.assertTrue(kwargs["control_chassis_rotate"])
-        self.assertAlmostEqual(kwargs["chassis_rotation"], math.pi / 2)
+        self.assertAlmostEqual(kwargs["chassis_rotation"], -math.pi / 2)
         self.assertEqual(kwargs["speed_level"], 0)
         self.assertFalse(agent._wake_turn_completed_at)
         self.assertEqual(agent._wake_turn_angle, 0.0)
 
-    async def test_default_255_wake_uses_45_degrees(self):
+    async def test_255_degree_bearing_keeps_existing_search_conversion(self):
         agent = make_agent()
         agent._mark_wake_turn_context(255)
 
         await agent._reset_dynamic_search_pose("go_find_person")
 
         kwargs = agent.ros2_interface.set_four_combine_motor_control.await_args.kwargs
-        self.assertAlmostEqual(kwargs["chassis_rotation"], math.pi / 4)
+        self.assertAlmostEqual(kwargs["chassis_rotation"], math.radians(105))
 
     async def test_without_wake_uses_scene_b_absolute_zero(self):
         agent = make_agent()
@@ -81,14 +81,14 @@ class SearchPoseSelectionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_wake_context_is_consumed_only_once(self):
         agent = make_agent()
-        agent._mark_wake_turn_context(0.9)
+        agent._mark_wake_turn_context(90)
 
         await agent._reset_dynamic_search_pose("go_find_person")
         await agent._reset_dynamic_search_pose("go_to_object")
 
         first = agent.ros2_interface.set_four_combine_motor_control.await_args_list[0].kwargs
         second = agent.ros2_interface.set_four_combine_motor_control.await_args_list[1].kwargs
-        self.assertAlmostEqual(first["chassis_rotation"], 0.9)
+        self.assertAlmostEqual(first["chassis_rotation"], -math.pi / 2)
         self.assertEqual(second["chassis_rotation"], 0.0)
 
     async def test_intervening_non_search_task_does_not_clear_context(self):
@@ -96,7 +96,7 @@ class SearchPoseSelectionTest(unittest.IsolatedAsyncioTestCase):
         agent.ros2_interface.forward_head = AsyncMock(
             return_value={"type": "forward_head", "success": True, "error_msg": ""}
         )
-        agent._mark_wake_turn_context(0.7)
+        agent._mark_wake_turn_context(40)
         marked_at = agent._wake_turn_completed_at
 
         await agent._execute_task_by_type("forward_head", {"angle": 0.1})
@@ -108,7 +108,7 @@ class SearchPoseSelectionTest(unittest.IsolatedAsyncioTestCase):
         agent.ros2_interface.find_person = MagicMock(
             return_value={"type": "find_person", "success": True}
         )
-        agent._mark_wake_turn_context(0.7)
+        agent._mark_wake_turn_context(40)
         marked_at = agent._wake_turn_completed_at
 
         await agent._execute_task_by_type("find_person", {"obj_name": "张三"})
@@ -125,7 +125,7 @@ class DynamicSearchFlowTest(unittest.IsolatedAsyncioTestCase):
             "result": 103,
             "error_msg": "四联电机执行失败",
         }
-        agent._mark_wake_turn_context(math.pi / 3)
+        agent._mark_wake_turn_context(300)
 
         with self.assertLogs("smart_robot_agent", level="ERROR") as logs:
             result = await agent.go_find_person("张三", "去找张三")
