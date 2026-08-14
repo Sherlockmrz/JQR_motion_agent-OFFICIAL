@@ -15,7 +15,7 @@
     <section class="hero">
       <div class="eyebrow">DOCUMENT ARCHIVE</div>
       <h1>Motion Agent 文档集</h1>
-      <p>三份附件原文、三张原始流程图，以及总体任务路由与下一任务预判规则。附件内容保存在 sources 中，HTML只负责整理展示。</p>
+      <p>Motion Agent 与 Kinbot Agent 的原始说明、架构图、流程图和开发计划。原文保存在 sources 中，HTML只负责整理展示。</p>
     </section>
 
     <section class="index-grid">
@@ -35,6 +35,10 @@
         <h2>04 · 总体架构与下一任务预判</h2>
         <p>输入、LLM/JSON解析、任务路由、执行通道、结果回传和长期任务连接规则。</p>
       </a>
+      <a class="index-card" href="05_kinbot_agent_development_plan.html">
+        <h2>05 · Kinbot Agent开发计划</h2>
+        <p>交互软件进展、开发工作流、目标架构、模块职责、Agentic System与代办结论。</p>
+      </a>
     </section>
 
     <section class="gallery">
@@ -49,6 +53,18 @@
       <article class="gallery-card">
         <img src="assets/find_person_sequence.png" alt="找人链路时序图">
         <div class="body"><strong>找人任务端到端时序图</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/kinbot_l1_agent_skill_architecture.png" alt="Kinbot L1基础业务Agent与Skill跨空间互连视图">
+        <div class="body"><strong>Kinbot L1 Agent与Skill目标架构</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/agentic_system_voice_workflow.png" alt="Agentic System语音与多Agent调度流程">
+        <div class="body"><strong>Agentic System语音交互流程</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/kinbot_console_tui.png" alt="Kinbot Rust Agent Console界面">
+        <div class="body"><strong>Kinbot Agent Console与调试命令</strong></div>
       </article>
     </section>
   </main>
