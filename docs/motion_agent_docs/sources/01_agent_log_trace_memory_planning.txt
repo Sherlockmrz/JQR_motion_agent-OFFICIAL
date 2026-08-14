@@ -1,0 +1,807 @@
+
+主线：7月15号找人找物
+[图片]
+Agent log 易读化
+目标：让日志变成“可以快速判断任务进展和失败原因”的日志。
+日志格式修改：
+[trace=xxx][任务名][阶段] 可以读懂的状态；关键字段
+例子：
+现有日志，之前找张三时能看到：
+[2026-06-26 15:59:03.022] INFO - websocket_control_server - 正在启动WebSocket控制服务器 ws://127.0.0.1:8766
+[2026-06-26 15:59:03.040] INFO - websockets.server - server listening on 127.0.0.1:8766
+[2026-06-26 15:59:31.034] INFO - websockets.server - connection open
+[2026-06-26 15:59:31.035] INFO - websocket_control_server - [WebSocket] 收到控制命令: type=go_find_person, params={'obj_name': '张三', 'user_prompt': '请去找张三'}
+[WS] 开始执行任务 type=go_find_person
+成功建立线程本地连接: ws://127.0.0.1:8000/ws/navigate
+Received response:
+{
+  "success": false,
+  "error_msg": "",
+  "type": "go_find_person"
+}
+克制一点，简洁易懂，信息不重复
+[trace=20260626-155931][找人] Agent已启动，可以接收上层任务
+[trace=20260626-155931][找人] 上层发来任务：找张三，原始指令="请去找张三"
+[trace=20260626-155931][找人] Motion Agent已接收任务，转换成 VLN 导航请求
+[trace=20260626-155931][找人] 连接vln，并发送 go_to_person/person_id=张三
+[trace=20260626-155931][找人] success=false 但 error_msg 为空；检查vln服务是否启动、地址是否正确
+ response 原来是：
+{"success": false,
+"error_msg": "",
+"type": "go_find_person"}
+改成：
+{"trace_id": "20260701-153102-go_find_person",
+"type": "go_find_person",
+"stage": "response_normalize",
+"success": false,
+"error_code": "EMPTY_ERROR_MSG_FROM_DOWNSTREAM",
+"error_msg": "任务失败，但下游没有提供标准 error_msg",
+"raw": {"success": false,"err_msg": "person_id not found"}}
+
+ 熟悉 Agent 端口
+暂时无法在i讯飞文档外展示此内容
+联调输出：
+暂时无法在i讯飞文档外展示此内容
+
+副线：主线结束/暂停后的 Agent 提升
+[图片]
+副线从“主线任务结束/暂停”开始，解决：Agent 不只是能把任务转发给 VLN，而是能从每次任务里形成可复盘轨迹、可用记忆、可复用经验。
+
+1. 记录备份调试完成的版本
+系统要保存每次关键变化的原始记录。出问题时，能知道当时的配置、命令、日志、版本。
+类型
+要记录什么
+作用
+代码版本
+git commit、tag、分支名
+后续改坏能回退
+配置快照
+LOCAL_MODEL_URI、WEBSOCKET_PORT、ROS2 启动方式
+避免端口和环境变化导致误判
+测试命令
+找人、找物、停止、急停的命令
+复现演示流程
+成功 trace
+至少一次成功链路
+作为后续评分和 skills 的正样本
+失败 trace
+至少一次失败链路
+作为错误处理改进样本
+已知问题
+例如 success=false 但 error_msg=""
+防止后续以为是新问题
+1. 后面做 trace、memory、skills 时有稳定版本可以回退。
+2. 后续每次改动都能和 baseline 对比。
+
+2. Agent 内置`trace_id` 评分系统
+
+trace_id 的作用是把一次任务从 8766、Motion Agent、8000 VLN、ROS2、最终 response 串成一条链。评分系统则是在这条链结束后，判断这次任务“做得好不好、哪里不好、下次应该改什么”。
+目标
+找人找物任务失败时，现在只能看到：
+{
+  "success": false,
+  "error_msg": "",
+  "type": "go_find_person"
+}
+有 trace 和评分后，Agent 能给出：
+这次任务 72 分
+主要问题：最终 response 不明确
+失败阶段：response_normalize
+建议：统一 success/result/error_msg/err_msg 字段映射
+落地设计
+每次任务进入 websocket_control_server.py 时生成或继承 trace_id：
+{
+  "trace_id": "20260716-101500",
+  "type": "go_find_person",
+  "params": {
+    "obj_name": "张三",
+    "user_prompt": "请去找张三"
+  }
+}
+Agent 内部建立 TraceLedger，每个阶段只追加事件：
+{
+  "trace_id": "20260716-101500-go_find_person",
+  "event_id": "evt-0003",
+  "stage": "agent_to_vln",
+  "event": "send_request",
+  "task_type": "go_find_person",
+  "success": true,
+  "summary": "已发送 go_to_person 到 8000 VLN",
+  "valid_time": "2026-07-16T10:15:03",
+  "transaction_time": "2026-07-16T10:15:03.120"
+}
+这里的trace太小太局限了，traceid的生成和log更改内容完全没有问题，举个例子比如在一些复杂任务里（我要查一下天气，然后进屋子里找张三，找到以后提醒他如果下雨要带伞。），一个trace是从开始到结束的一整个流程可能包含很多子任务，但别加别的id了只有一个traceid，但TraceLedger的构建需要重新思考
+评分维度：这个要非常细化，调研打分机制//log给模型，评分机制简化，jqr框架流程trace有哪些可以作为优化，失败机制，产出文档，内置agent，在一个workspace，输入，end=repsonse
+仔细阅读这个文档（）我现在想完成这个根据traceid的记录给一次任务进行打分的打分机制，不要你给我具体的代码实现我就要你给我像文档里面那个打分表格一样的打分表，再简化一点，现在实现不了/量化不了的东西不能上打分表格，这个是前几个任务log的内容（）首先保证成功率，要一个通用的打分表，所以你要看这个agent可以实现的全部任务，可以按成功的话实现几次尝试尝试越少越高分，再给几个条件我可以看合不合理，你也要详细的说明理由，不要过度设计
+评分项
+分值
+解释
+我们 Agent 的判断依据
+任务结果
+50
+是否完成找人/找物，是否有最终状态
+final response 是否成功，是否收到 result/success
+链路完整度
+
+50
+
+8766、Agent、8000、ROS2 是否都有记录
+trace 里是否包含关键 stage
+恢复建议
+10optional
+
+有没有下一步建议
+非模块内部问题不能算入，等agent有修复能力之后再看再制定评分标准
+是否能输出检查 8000、字段映射、底盘等建议
+时间动态更新
+10optional
+有没有用过期状态做判断
+是否记录transaction time
+安全性，事件触发，安全模块，1 指令安全，先确认 2随时可以停止
+15optional
+
+是否尊重停止/急停优先级
+
+是否触发危险重试或忽略 stop
+评分结果示例：
+{
+  "trace_id": "20260716-101500-go_find_person-a7c9",
+  "score": 72,
+  "grade": "needs_improvement",
+  "main_issue": "VLN 已连接，但最终 response success=false 且 error_msg 为空",
+  "stage": "response_normalize",
+  "suggestion": "统一 success/result/error_msg/err_msg 字段，并把 command 标记为 intermediate"
+}
+
+隐私与内部自学习：trace 默认不直接给人看， 等轨迹出来
+
+实际运用中，每个 trace 可能包含比较敏感的信息，例如用户原始语音文本、目标人名、摄像头识别结果、机器人所在位置、设备 IP、失败时的原始返回、甚至某些多模识别摘要。所以更合理的方式是：
+原始 trace：Agent 内部可见，用于评分、复盘和策略学习
+脱敏 view：人和上层系统可见，只展示阶段、分数、错误类型和建议
+
+在 trace 评分里的含义
+应用
+Ledger 原始账本
+原始 trace 只追加不修改，保证内部可追溯
+task_ledger.jsonl 保存完整事件，但默认不直接暴露给人
+Views 派生视图
+给人看的不是原始 trace，而是脱敏摘要
+生成 trace_score_view、recent_failure_view
+记忆学习
+trace 让 Agent 改变下一步动作
+评分结果进入 AgentMemory，影响后续执行策略
+Vector DB limits
+原始 trace 不应该直接进向量库
+只把脱敏摘要或经验描述放入相似检索
+时间管理/双时间
+trace 和评分要有有效期，旧经验不能永久影响决策
+记录 valid time / transaction time，过期 trace 只保留摘要
+原始 trace 内部记录：
+{
+  "trace_id": "20260716-101500-go_find_person",
+  "stage": "vln_infer",
+  "task_type": "go_find_person",
+  "target": "张三",
+  "user_prompt": "请去找张三",
+  "robot_location": "二楼走廊",
+  "raw_response": {
+    "command": "右转55度",
+    "inference_time_ms": 680.4
+  },
+  "visibility": "agent_internal_only"
+}
+给人或上层系统看的派生 view：
+{
+  "trace_id": "20260716-101500-go_find_person",
+  "task_type": "go_find_person",
+  "score": 72,
+  "stage": "vln_infer",
+  "summary": "找人任务已进入 VLN 推理阶段，并收到中间动作",
+  "main_issue": "未收到最终 result",
+  "suggestion": "继续等待 final response，超时后返回明确错误",
+  "privacy": "redacted"
+}
+
+Agent 怎么自学习
+让 Agent 根据 trace 评分更新自己的记忆、视图和策略：
+执行任务 -> 生成 trace -> 内部评分 -> 写入 AgentMemory -> 更新 Views -> Policy 改变下一次动作
+
+例子 ：8000 VLN 连续连接失败。
+第 1 次 trace：VLN_CONNECT_FAILED，score=45
+第 2 次 trace：VLN_CONNECT_FAILED，score=42
+第 3 次 trace：VLN_CONNECT_FAILED，score=43
+AgentMemory 生成 view：
+{
+  "view_type": "recent_failure_view",
+  "task_type": "go_find_person",
+  "top_failure": "VLN_CONNECT_FAILED",
+  "count_last_3": 3,
+  "suggestion": "下次导航前先做 VLN 健康检查"
+}
+Policy 改变下一次动作：
+以前：收到 go_find_person -> 直接发给 8000
+Policy：收到 go_find_person -> 先检查 8000 是否可连接 -> 不可连接则直接返回明确错误
+例子 2：目标找不到。
+最近 3 次找张三都是 TARGET_NOT_FOUND
+Agent 学到的策略：
+以前：继续重复“找张三”
+Policy：先读 target_context_view，看张三最近是否有有效位置；没有就让交互 Agent 追问“张三今天穿什么衣服/大概在哪里”
+3. 可以更快复盘。
+4. AgentMemory 可以把评分低的 trace 变成失败记忆。
+5. Skills 可以把评分高、复现稳定的 trace 变成可复用流程。
+6. 原始 trace 默认只在 Agent 内部用于评分和自学习，外部只暴露脱敏 view，减少隐私风险。
+
+目标：生成 Agent 决策模型的 RL 数据集在agent内部自训练（修正）
+
+最后希望通过 trace_id 实现把每一次真实任务都变成 Agent 可以学习的数据来源。每一次分数高的或者通过修改实现成功的通过 trace 记录下来，然后接入 LLM 做内部分析和标注，生成用于 Agent 决策大模型训练的数据集。
+一条 trace 可以转成这样的训练样本：
+{
+  "sample_id": "rl-sample-20260716-001",
+  "trace_id": "20260716-101500-go_find_person-a7c9",
+  "state": {
+    "task_type": "go_find_person",
+    "stage": "agent_to_vln",
+    "recent_failure": "VLN_CONNECT_FAILED",
+    "vln_endpoint_status": "unavailable",
+    "retry_count": 2
+  },
+  "action_taken": "retry_go_find_person",
+  "outcome": {
+    "success": false,
+    "error_code": "VLN_CONNECT_FAILED"
+  },
+  "better_action": "run_vln_health_check_before_navigation",
+  "reward": -1,
+  "reason": "8000 VLN 服务不可连接时，重复发送找人任务没有意义，应先检查服务状态"
+}
+如果一次 trace 做得很好，生成正样本：
+{
+  "sample_id": "rl-sample-20260716-002",
+  "trace_id": "20260716-103000-go_find_person-b8d2",
+  "state": {
+    "task_type": "go_find_person",
+    "stage": "vln_infer",
+    "received_command": true,
+    "final_received": false
+  },
+  "action_taken": "mark_command_intermediate_and_wait_final",
+  "outcome": {
+    "success": true,
+    "final_received": true
+  },
+  "reward": 1,
+  "reason": "VLN command 是中间动作，继续等待 final result 后任务状态更准确"
+}
+这样可以形成几类训练数据：
+数据类型
+来源
+用途
+状态-动作-结果样本
+每条 trace 的关键阶段
+训练 Agent 在某个状态下选什么动作
+成功/失败 reward 
+trace score 和最终结果
+让模型知道哪些策略更好
+偏好对数据 
+LLM 或人工比较两个动作
+做“哪个下一步更合理”的偏好学习
+失败恢复数据
+低分 trace + 改进建议
+训练 Agent 遇到失败时如何恢复
+skill 
+高分 trace
+训练或抽取稳定可复用流程
+
+1. 第一阶段：只做 trace 记录和规则评分，让Policy改变决策。
+2. 第二阶段：让 LLM 根据 trace 生成复盘摘要和改进建议。
+3. 第三阶段：把 trace 转成 reward 数据集。
+4. 第四阶段：人工抽查数据质量，避免错误经验被学进去。
+5. 第五阶段：训练或微调 Agent 决策模型，用于推荐下一步动作。
+
+3. Agent Planning
+
+LLM拆任务，先做意图识别理解，分类（简单任务/复杂任务）调研现在的agent比如codex，Claude code是怎么做这种agent planning的 
+边界
+Motion Agent 
+输入
+接收上层交互 Agent 的结构化 intent 或自然语言兜底结果
+规划
+拆成子任务、判断依赖、选择工具、确定执行顺序
+执行
+调用 VLN、ROS2、本地动作、状态查询、停止任务
+反馈
+返回 plan 状态、当前 step、失败原因、需要上层追问的信息
+安全
+任何时候 stop/emergency_stop 优先，危险动作必须被拦截
+整体流程可以是：
+用户复杂指令
+  -> 交互 Agent / Motion Agent 得到文本或 intent
+  -> Planner LLM 生成 Plan 草稿
+  -> PlanValidator 校验字段、安全、工具可用性
+  -> PlanExecutor 按 step 执行
+  -> 每一步写 trace
+  -> 失败时 RecoveryPolicy 决定重试、追问、停止或重规划
+比如用户说：
+我要查一下天气，然后进屋子里找张三，找到以后提醒他如果下雨要带伞。
+大模型可以先生成草稿：
+{
+  "steps": [
+    {
+      "step_id": "S1",
+      "type": "info_query",
+      "name": "查询天气"
+    },
+    {
+      "step_id": "S2",
+      "type": "navigate",
+      "name": "进入屋内",
+      "depends_on": ["S1"]
+    },
+    {
+      "step_id": "S3",
+      "type": "search_person",
+      "name": "寻找张三",
+      "depends_on": ["S2"]
+    },
+    {
+      "step_id": "S4",
+      "type": "condition",
+      "name": "判断是否下雨且找到张三",
+      "depends_on": ["S1", "S3"]
+    },
+    {
+      "step_id": "S5",
+      "type": "notify",
+      "name": "提醒张三带伞",
+      "depends_on": ["S4"]
+    }
+  ]
+}
+主任务
+{
+  "plan_id": "plan-20260720-001",
+  "trace_id": "20260720-101500",
+  "user_goal": "查天气，进屋找张三，提醒他下雨带伞",
+  "mode": "sequential_with_conditions",
+  "status": "pending",
+  "steps": [],
+  "global_constraints": {
+    "stop_on_emergency": true,
+    "max_total_duration_s": 600,
+    "require_final_summary": true
+  }
+}
+每个子任务用 PlanStep 表示：
+{
+  "step_id": "S2",
+  "name": "进入房间",
+  "type": "navigate",
+  "executor": "motion_agent",
+  "tool": "local_navigation_or_vln",
+  "depends_on": ["S1"],
+  "params": {
+    "target_location": "屋内"
+  },
+  "success_criteria": [
+    "机器人到达屋内或 VLN 返回到达/进入完成"
+  ],
+  "timeout_s": 180,
+  "retry_policy": {
+    "max_retries": 1,
+    "on_retry": "replan_with_vln"
+  },
+  "fallback": "ask_upper_agent_for_room_clarification",
+  "status": "pending"
+}
+字段
+为什么需要
+step_id
+后续 trace、依赖、失败定位都靠它
+type
+决定走信息查询、VLN、ROS2、本地动作还是交互反馈
+tool
+决定调用哪个具体能力
+depends_on
+防止顺序错，比如没查天气就先提醒
+success_criteria
+判断这一步到底算不算完成
+timeout_s
+防止无限等待
+retry_policy
+失败时不要盲目重复
+fallback
+失败后知道问人、停止、换工具还是跳过
+status
+支持暂停、恢复、复盘
+
+ 任务类型与执行标准
+Planning 里要把任务分类型，定执行标准。
+类型
+例子
+是否接 VLN
+成功标准
+失败标准
+info_query
+查天气、查时间、查任务配置
+不接 VLN
+拿到结构化结果，例如 rain=true
+查询失败或超时
+navigate
+进屋、去门口、去桌边
+视情况
+到达目标点或 VLN/ROS2 返回完成
+Nav2 timeout、目标不可达
+search_person
+找张三
+通常接 VLN
+找到目标或到达目标附近
+TARGET_NOT_FOUND、识别失败
+search_object
+找水杯
+通常接 VLN
+找到物体或返回位置
+OBJECT_NOT_FOUND
+local_action
+停止、急停、头部动作、RGB
+不接 VLN
+本地 ROS2/action 返回成功
+ROS2 unavailable
+notify
+提醒张三带伞
+不接 VLN
+上层交互 Agent/TTS 接收通知
+找不到提醒对象或 TTS 失败
+condition
+如果下雨才提醒
+不接 VLN
+条件被明确判断
+条件结果未知
+wait
+等待用户确认、等待 final result
+不接 VLN
+收到确认或 final
+超时
+“去门口”：
+如果门口位置已知 -> go_to_door / Nav2
+如果门口要靠视觉识别 -> VLN
+
+“找张三”：
+需要视觉目标识别 -> VLN
+
+“查天气”：
+不需要机器人移动 -> info_query，结果作为后续 condition
+
+例子：
+我要查一下天气，然后进屋子里找张三，找到以后提醒他如果下雨要带伞。
+Motion Agent 生成的计划可以是：
+{
+  "plan_id": "plan-weather-room-person-001",
+  "trace_id": "20260720-101500-weather_find_person",
+  "user_goal": "查天气，进屋找张三，如果下雨提醒带伞",
+  "status": "pending",
+  "steps": [
+    {
+      "step_id": "S1",
+      "name": "查询天气",
+      "type": "info_query",
+      "tool": "weather_query_or_upper_agent",
+      "params": {
+        "location": "当前城市",
+        "fields": ["rain_probability", "weather_text"]
+      },
+      "success_criteria": ["拿到 rain=true/false 或降雨概率"],
+      "timeout_s": 15,
+      "fallback": "ask_upper_agent_for_weather"
+    },
+    {
+      "step_id": "S2",
+      "name": "进入屋内",
+      "type": "navigate",
+      "tool": "local_navigation_or_vln",
+      "depends_on": ["S1"],
+      "params": {
+        "target_location": "屋内"
+      },
+      "success_criteria": ["机器人进入屋内或到达屋内目标点"],
+      "timeout_s": 180,
+      "fallback": "ask_for_room_target_or_stop"
+    },
+    {
+      "step_id": "S3",
+      "name": "寻找张三",
+      "type": "search_person",
+      "tool": "vln_go_to_person",
+      "depends_on": ["S2"],
+      "params": {
+        "person_id": "张三",
+        "user_prompt": "请在屋内寻找张三"
+      },
+      "success_criteria": ["VLN/识别模块确认找到张三，或到达张三附近"],
+      "timeout_s": 240,
+      "fallback": "ask_for_more_person_description"
+    },
+    {
+      "step_id": "S4",
+      "name": "判断是否需要提醒",
+      "type": "condition",
+      "depends_on": ["S1", "S3"],
+      "condition": "weather.rain == true AND person_found == true",
+      "success_criteria": ["条件判断完成"],
+      "fallback": "skip_notify_with_reason"
+    },
+    {
+      "step_id": "S5",
+      "name": "提醒张三带伞",
+      "type": "notify",
+      "tool": "upper_agent_tts_or_notification",
+      "depends_on": ["S4"],
+      "params": {
+        "message": "张三，今天可能下雨，出门记得带伞。"
+      },
+      "success_criteria": ["提醒内容已交给交互 Agent/TTS 或已播报"],
+      "timeout_s": 30,
+      "fallback": "return_notify_failed"
+    }
+  ]
+}
+S1 查询天气
+这是信息任务，不需要 VLN。如果 Motion Agent 以后接了天气工具，就直接调用；如果没有天气工具，就向上层交互 Agent 返回一个 need_external_info 请求。
+{
+  "type": "need_external_info",
+  "field": "weather",
+  "question": "请查询当前城市是否下雨"
+}
+成功标准：
+拿到 weather.rain = true/false
+或者 rain_probability >= 某阈值
+S2 进入屋内
+这是运动任务。是否接 VLN 取决于屋内目标是否明确：
+有固定房间点位 -> 本地导航/Nav2
+没有固定点位，需要视觉找门/进屋 -> VLN
+成功标准：
+机器人到达屋内目标点
+或 VLN 返回进入完成
+或 ROS2/Nav2 返回 success
+失败处理：
+目标点不存在 -> 询问上层“具体进哪个房间”
+Nav2 timeout -> 标记为导航/底盘问题
+VLN_CONNECT_FAILED -> 先检查 8000
+S3 寻找张三
+这是视觉导航任务，通常接 VLN：
+
+  "type": "go_to_person",
+  "user_prompt": "请在屋内寻找张三",
+  "person_id": "张三"
+}
+成功标准：
+找到张三
+或到达张三附近
+或识别模块确认目标出现
+失败处理：
+TARGET_NOT_FOUND -> 询问衣着/位置/更多描述
+连续找不到 -> 换搜索区域或结束并返回明确原因
+只收到 command 没有 final -> 等待 final，超时返回 FINAL_RESULT_TIMEOUT
+
+S4 提醒
+这是条件任务
+如果 weather.rain == true 且 person_found == true -> 执行提醒
+如果 weather.rain == false -> 不提醒带伞，返回“天气不下雨，无需提醒”
+如果 person_found == false -> 不提醒，返回“未找到张三”
+
+S5 提醒张三带伞
+Motion Agent返回给交互 Agent：
+{
+  "type": "notify",
+  "target": "张三",
+  "message": "张三，今天可能下雨，出门记得带伞。",
+  "delivery": "tts_or_upper_agent"
+}
+成功标准：
+上层交互 Agent/TTS 确认收到提醒请求
+
+
+
+4. AgentMemory 完整记忆系统//混合检索，数据，什么样的数据端侧保存，
+ Agent Memory 系统需要解决四个问题：
+策略
+问题
+分层设计
+什么信息短期保存，什么信息长期保存，什么信息只做摘要
+读写策略
+什么时候读，什么时候写，哪些信息不该写
+时间管理
+信息什么时候生效，什么时候过期，什么时候被更新
+经验沉淀
+哪些失败和成功值得变成下次决策依据
+当前 AgentMemory是过程记录，还不是完整记忆系统。后续要让它参与真实决策：
+如果最近 3 次都是 VLN_CONNECT_FAILED -> 先检查 8000
+如果最近 3 次都是 TARGET_NOT_FOUND -> 询问目标描述或换搜索区域
+如果上一次是 ERROR_FIELD_MISMATCH -> 优先修返回结构
+
+向量数据库的局限，模糊语义匹配不等于精准查找
+VECTOR DB LIMITS：向量数据库适合“口味偏好、历史对话”这种近似匹配，但 Agent 需要“手机号、精确属性、键值查找路径”这种精准查找。
+结构化存储：SQLite / JSONL / dict，保存精确状态和键值
+向量检索：只保存语义摘要，用来找相似失败、相似场景、相似经验
+
+时间状态问题
+上一次机器人位置：门口
+当前机器人位置：会议室
+上一次 VLN endpoint：192.168.31.43:8000
+当前 VLN endpoint：127.0.0.1:8000
+上一次张三位置：办公室
+当前张三可能在走廊
+如果 AgentMemory 只存“张三在办公室”而没有时间，就可能让机器人去旧位置找人。
+所以每条记忆必须有时间状态：双时间协同
+[图片]
+字段
+作用
+valid_from
+这条事实从什么时候开始真实有效
+valid_to
+这条事实到什么时候失效
+transaction_time
+系统什么时候写入这条记录
+is_current
+是否是当前有效状态
+supersedes
+这条记录覆盖了哪条旧记录
+confidence
+可信度，避免把低可信观察当事实
+{
+  "memory_type": "target_location",
+  "target": "张三",
+  "location": "办公室",
+  "valid_from": "2026-07-10T09:00:00",
+  "valid_to": "2026-07-10T11:00:00",
+  "transaction_time": "2026-07-10T09:05:12",
+  "is_current": false,
+  "confidence": 0.62
+}
+新的记录：
+{
+  "memory_type": "target_location",
+  "target": "张三",
+  "location": "走廊",
+  "transaction_time": "2026-07-10T11:21:03",
+  "is_current": true,
+  "confidence": 0.81
+}
+
+四层架构
+L1 会话元数据与 L2 用户/任务结构化
+
+图片里的四层架构前两层是：
+
+L1 会话元数据：临时，不持久化；对话结束即可释放
+L2 用户结构化：偏好、身份、历史决策，JSON，键值查找
+层级
+ Agent
+生命周期
+存储方式
+L1 任务元数据
+当前 WebSocket client、当前 task、当前临时 observation
+当前任务结束即释放
+内存 dict
+L2 结构化长期状态
+端口配置、任务协议、目标 profile、常见 error_code、用户确认过的偏好
+用户掌控
+JSON/SQLite key-value
+（L3 近期摘要与 L4 滑动窗口）
+L3 近期摘要：多轮会话 -> 主题浓缩，意义留存 / 体量精简
+L4 滑动窗口：当前轮次上下文，溢出 -> 淘汰旧项
+层级
+作用
+agent例子
+L3 近期摘要
+把最近多次任务压缩成可读摘要
+“最近 5 次找人任务中，3 次失败于 VLN_CONNECT_FAILED，2 次只收到 command 未收到 final”
+L4 滑动窗口
+当前任务只保留最近关键事件
+最近 20 条 trace event、最近 5 条 VLN command、最近 3 条 ROS2 feedback
+
+ AgentMemory 结构
+AgentMemory
+  - session_state        L1 当前任务临时状态
+  - structured_store     L2 精确键值状态
+  - recent_summaries     L3 近期摘要
+  - sliding_window       L4 当前上下文窗口
+  - ledger               只追加原始事件（trace）
+  - views                派生视图
+  - policy               隐私、时间、更改策略
+可以先不引入复杂数据库，先用 JSONL + 内存 ：
+文件
+作用
+memory/task_ledger.jsonl
+追加原始事件
+memory/failure_records.jsonl
+失败记录
+memory/trace_scores.jsonl
+trace 评分
+memory/structured_state.json
+精确键值状态
+memory/recent_summaries.json
+近期摘要
+
+提升
+提升
+具体表现
+少重复失败
+8000 没启动时不会连续发 10 次找人任务
+更准的上下文
+只读取当前任务相关 memory，不全量塞历史
+更少误判
+字段映射问题不会被误判成底盘问题
+更强联调价值
+能说清楚失败发生在 Agent、VLN、ROS2 还是底盘
+可沉淀经验
+高质量记忆可以成为 skills 的证据来源
+
+5. Skills 沉淀//hermes
+把反复验证过、可迁移、能提高效率的经验固化下来。
+流程应该是：
+trace  -> trace score -> memory summary -> 人工审核 -> skill
+只有满足这些条件才沉淀：
+条件
+要求
+分数
+trace score >= 85
+复现次数
+相同模式至少成功 3 次
+安全
+没有急停、危险动作、误触发
+可迁移
+不绑定某一个人名或某一次固定环境
+有兜底
+失败时知道停止、重试、询问还是交给人
+有证据
+附带 trace_id 和 memory evidence
+
+Skill 1：目标找不到后的二阶段策略
+
+适用场景：Memory 显示同一目标连续多次 TARGET_NOT_FOUND。
+name: target_not_found_second_pass
+trigger:
+  error_code: TARGET_NOT_FOUND
+  repeat_count_gte: 3
+steps:
+  - 读取 target_context_view
+  - 检查目标是否有最近有效位置
+  - 如果有，先去最近有效位置附近搜索
+  - 如果没有，询问上层目标衣着、位置或更多描述
+  - 如果仍失败，返回明确失败原因
+fallback:
+  - 不继续无限重试同一个搜索动作
+提升优点：让 Agent 从“重复失败”升级为“换策略搜索”。
+
+Skill 2：返回结构标准化
+
+适用场景：收到下游返回，字段可能是 success/result/error_msg/err_msg/command。
+name: normalize_agent_response_contract
+trigger:
+  stage: response_normalize
+steps:
+  - 如果有 success，优先用 success
+  - 如果没有 success 但有 result 且是 bool，用 result 映射 success
+  - 如果 success=false，error_msg 必须非空
+提升优点：消除 success=false 但 error_msg="" 的问题，给 ReAct 和人类复盘都提供明确依据。
+
+Skills 带来的提升
+提升
+具体表现
+更快执行
+常见流程不用每次重新推理
+更少错误
+协议打包、字段映射、健康检查变成固定流程
+更可复盘
+每个 skill 都有 evidence trace 和 memory 依据
+更安全
+失败兜底和急停优先级写在 skill 里
+与 Memory 分工清楚
+Memory 提供状态和证据，Skill 提供可执行步骤
+
+当前任务
+
+6. 日志改写得人能看懂。
+7. 再熟悉端口和代码链路，准备底盘联调 checklist。
+8. Log 稳定后冻结 7 月 15 日演示版本。
+9. 后续在新分支按 trace 评分 -> AgentMemory 完整系统 -> Skills 固化流程 的顺序推进。

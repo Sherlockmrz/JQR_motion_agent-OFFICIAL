@@ -1,0 +1,1297 @@
+基于现有运动agent进行新增对复杂任务的任务编排和执行计划，初始版
+目标是：
+复杂自然语言
+→ LLM一次生成完整步骤和depends_on
+→ compile_plan()检查工具、参数、依赖、循环、结果条件
+→ run_plan()判断ready步骤
+→ 物理任务最多一个，只读任务最多四个（并行）
+→ 调用现有agent.execute_task()
+→ 根据真实结果继续、失败或停止
+一、整体架构
+WebSocket 8766 / USB
+        │
+        ▼
+读取现有 type / params
+        │
+        ├── type == stop_move
+        │   
+        │       └── 立即调用现有 agent.stop_move()
+        │
+        ├── type == natural_language
+        │       ↓
+        │   LLM Planner
+        │       ↓
+        │   一次生成完整 PlanDraft
+        │       ↓
+        │   compile_plan()
+        │       ├── 工具检查
+        │       ├── 参数检查
+        │       ├── depends_on检查
+        │       ├── 循环依赖检查
+        │       ├── expect结果条件检查
+        │       └── 注入physical/parallel分类
+        │
+        ├── 已确认安全的只读 type
+        │       └── parallel_slots，最多4个
+        │
+        └── 现有普通 type
+                ↓
+            单步骤计划
+                ↓
+            run_plan()
+run_plan()
+    ├── physical_lock：物理/硬件任务最多1个
+    ├── parallel_slots：安全只读任务最多4个
+    ├── states：每个步骤的运行状态
+    ├── results：每个步骤的真实结果
+    └── stop_event：收到停止后不再启动新步骤
+                │
+                ▼
+       现有 agent.execute_task()
+                │
+                ▼
+       ROS / VLN / 药箱 / 电机 / 灯光
+只需要一个新的主要代码模块：
+simple_orchestrator.py
+里面放：
+任务分类表
+Planner工具说明
+generate_plan()
+compile_plan()
+run_plan()
+stop_current_plan()
+physical_lock
+parallel_slots
+active_plan
+
+---
+二、对当前代码具体新增和调整什么
+暂时无法在i讯飞文档外展示此内容
+WebSocket 当前直接调用：
+result = await self.agent.execute_task(task)
+未来概念上改为：
+result = await self.orchestrator.handle(task)
+但 orchestrator 最终仍然会调用原来的：
+await self.agent.execute_task({
+    "type": step["type"],
+    "params": step["params"],
+})
+
+---
+三、当前51个功能的完整分类
+当前 known_task_types 一共有51项
+分类结果是：
+45个 physical
+1个 parallel
+5个控制旁路
+合计51个
+1. physical_lock：45项
+会改变机器人、调用ROS/MCU/VLN/相机、使用共享通信链路，或者尚未人工证明可以并行的任务。
+PHYSICAL_TYPES = frozenset({
+    # 找人、找物、导航
+    "find_object",
+    "find_person",
+    "go_to_object",
+    "go_find_person",
+    "follow_person",
+    "back_to_last_position",
+    "go_to_door",
+    # 当前会调用ROS/MCU的状态查询
+    "get_move_mode",
+    "get_medicine_box_state",
+    "get_medicine_box_status",
+    "get_status_light_state",
+    "get_robot_rise_state",
+    "get_robot_tilt_state",
+    "get_screen_tilt_state",
+    "get_laser_pointer_state",
+    # 药箱、故障、灯光、人脸数据
+    "set_medicine_box_switch",
+    "set_medicine_box_command",
+    "clear_fault",
+    "set_robot_light_state",
+    "set_status_light_scene",
+    "set_robot_rise_jqr",
+    "set_robot_tilt_jqr",
+    "set_screen_tilt_jqr",
+    "set_laser_pointer",
+    "set_rgb",
+    "delete_person",
+    # 头部、底盘、组合电机
+    "wake_turn_to_person",
+    "forward_head",
+    "set_head_motor_control",
+    "set_combine_motor_control",
+    "set_four_combine_motor_control",
+    "set_four_combine_waypoint_control",
+    "four_dof_head_sequence",
+    "head_sweep_sequence",
+    "head_reset_to_zero",
+    "set_chassis_rotate_params",
+    "keyboard_motor_control",
+    # 预定义场景动作
+    "user_position_tracking",
+    "patrol_table_inspection",
+    "wake_head_range",
+    "wake_beyond_head_range",
+    "wake_side_moving",
+    "wake_back_moving",
+    "obstacle_avoidance_turn",
+    "move_forward_with_head_sweep",
+})
+为什么状态查询也先放physical
+例如 get_move_mode 看起来只是查询，但它会调用ROS服务。
+更重要的是，当前名字叫 _call_ros2_service_async() 的函数实际上是同步等待：
+while not future.done():
+    time.sleep(0.01)
+所以这些任务目前存在两个问题：
+1. 使用ROS/MCU共享通信链路。
+2. 可能阻塞整个 asyncio 事件循环。
+在逐项验证和改造成非阻塞调用前，保守放进物理锁。
+3. parallel_slots：当前确认1项
+PARALLEL_TYPES = frozenset({
+    "get_rgb_light_strip_state",
+})
+get_rgb_light_strip_state 只在内存锁下读取由ROS话题回调更新的RGB状态：
+with self.rgb_state_lock:
+    rgb_switch = self.rgb_state.get(...)
+- 不发送ROS服务请求。
+- 不移动硬件。
+- 不调用VLN。
+- 不修改RGB状态。
+- 只读取已经缓存的内存。
+所以可以使用并行。
+4. 控制旁路：5项
+CONTROL_TYPES = frozenset({
+    "stop_move",
+    "pause_move",
+    "emergency_stop",
+    "stop_follow",
+    "stop_navigate",
+})
+- stop_follow 路由到了全局未实现的TODO函数。
+- stop_navigate 也路由到了全局未实现的TODO函数。
+因此准备只把 stop_move 作为有效停止入口。
+
+---
+四、以后可以拆出来的parallel任务
+当前真正可并行的外部type只有一个，但代码里已经有一些可以改造成只读工具的基础。
+暂时无法在i讯飞文档外展示此内容
+
+---
+五、一个物理锁和四个并行怎样创建
+class SimpleOrchestrator:
+    def 
+__init__
+(self, agent, logger):
+        self.agent = agent
+        self.logger = logger
+        # 机器人动作房间只有一把钥匙
+        self.physical_lock = asyncio.Lock()
+        # 安全只读任务最多同时运行4个
+        self.parallel_slots = asyncio.Semaphore(4)
+        # 保护“当前计划”变量
+        self.state_lock = asyncio.Lock()
+        # 防止连续多个stop同时发送给VLN和底盘
+        self.stop_call_lock = asyncio.Lock()
+        self.active_plan = None
+必须保证全系统只有一个 SimpleOrchestrator 实例。
+
+---
+六、哪些工具允许LLM规划
+建议第一版只向LLM开放较高层、参数清楚的工具。
+PLANNER_VISIBLE_TYPES = frozenset({
+    "find_object",
+    "find_person",
+    "go_to_object",
+    "go_find_person",
+    "follow_person",
+    "back_to_last_position",
+    "go_to_door",
+    "set_medicine_box_command",
+    "get_medicine_box_status",
+    "set_status_light_scene",
+    "get_status_light_state",
+    "get_move_mode",
+    "get_robot_rise_state",
+    "set_robot_rise_jqr",
+    "get_robot_tilt_state",
+    "set_robot_tilt_jqr",
+    "get_screen_tilt_state",
+    "set_screen_tilt_jqr",
+    "set_laser_pointer",
+    "get_laser_pointer_state",
+    "set_rgb",
+    "get_rgb_light_strip_state",
+    "wake_turn_to_person",
+    "forward_head",
+    "user_position_tracking",
+    "patrol_table_inspection",
+    "wake_head_range",
+    "wake_beyond_head_range",
+    "wake_side_moving",
+    "wake_back_moving",
+    "obstacle_avoidance_turn",
+    "move_forward_with_head_sweep",
+    "head_reset_to_zero",
+})
+第一版不交给LLM自主生成：
+DIRECT_ONLY_TYPES = frozenset({
+    # 控制入口
+    "stop_move",
+    "pause_move",
+    "emergency_stop",
+    "stop_follow",
+    "stop_navigate",
+    # 维护或删除
+    "clear_fault",
+    "delete_person",
+    # 低层原始电机控制
+    "set_head_motor_control",
+    "set_combine_motor_control",
+    "set_four_combine_motor_control",
+    "set_four_combine_waypoint_control",
+    "four_dof_head_sequence",
+    "head_sweep_sequence",
+    "set_chassis_rotate_params",
+    "keyboard_motor_control",
+    # 旧兼容接口，规划时使用新接口
+    "set_medicine_box_switch",
+    "get_medicine_box_state",
+    "set_robot_light_state",
+})
+这样可以避免模型直接生成：
+清除所有故障
+删除张三人脸
+发送底层电机原始角度
+急停其他任务
+这些功能仍可由明确的直接JSON请求使用
+
+---
+七、任务工具表如何定义
+模型不能只看到工具名字，还要知道参数。
+建议使用一个手工维护的任务契约表。
+from dataclasses import dataclass, field
+from typing import Any
+@dataclass(frozen=True)
+class ParamRule:
+    kinds: tuple[str, ...]
+    required: bool = False
+    enum: tuple[Any, ...] | None = None
+@dataclass(frozen=True)
+class TaskSpec:
+    description: str
+    params: dict[str, ParamRule]
+    output_paths: frozenset[str] = frozenset({"/success"})
+    timeout: float = 30.0
+先登记常用工具：
+TASK_SPECS = {
+    "go_to_object": TaskSpec(
+        description="导航寻找指定物体",
+        params={
+            "obj_name": ParamRule(("string",), required=True),
+            "pixel_position": ParamRule(("array",)),
+        },
+        timeout=120,
+    ),
+    "find_object": TaskSpec(
+        description="查询并在必要时动态寻找物体",
+        params={
+            "obj_name": ParamRule(("string",), required=True),
+            "user_prompt": ParamRule(("string",)),
+        },
+        output_paths=frozenset({
+            "/success",
+            "/pixel_position",
+            "/position_description",
+        }),
+        timeout=120,
+    ),
+    "find_person": TaskSpec(
+        description="使用本地相机静态识别指定人员",
+        params={
+            "obj_name": ParamRule(("string",), required=True),
+            "user_prompt": ParamRule(("string",)),
+        },
+        output_paths=frozenset({
+            "/success",
+            "/obj_name",
+            "/result_msg",
+        }),
+        timeout=40,
+    ),
+    "go_find_person": TaskSpec(
+        description="通过VLN寻找指定人员",
+        params={
+            "obj_name": ParamRule(("string",), required=True),
+            # 当前方法签名要求user_prompt，不能省略
+            "user_prompt": ParamRule(("string",), required=True),
+        },
+        timeout=120,
+    ),
+    "follow_person": TaskSpec(
+        description="跟随人员",
+        params={
+            "location_info": ParamRule(("string",)),
+        },
+        timeout=120,
+    ),
+    "back_to_last_position": TaskSpec(
+        description="返回导航前记录的位置",
+        params={},
+        timeout=120,
+    ),
+    "go_to_door": TaskSpec(
+        description="导航到门口预设位置",
+        params={},
+        timeout=120,
+    ),
+    "set_medicine_box_command": TaskSpec(
+        description="控制药箱停止、打开或关闭",
+        params={
+            "command": ParamRule(
+                ("string", "integer"),
+                required=True,
+                enum=("stop", "open", "close", 0, 1, 2),
+            ),
+            "wait": ParamRule(("boolean",)),
+            "timeout": ParamRule(("number",)),
+            "poll_interval": ParamRule(("number",)),
+        },
+        output_paths=frozenset({
+            "/success",
+            "/completed",
+            "/status/state_name",
+        }),
+        timeout=15,
+    ),
+    "get_medicine_box_status": TaskSpec(
+        description="查询药箱完整MCU状态",
+        params={},
+        output_paths=frozenset({
+            "/success",
+            "/valid",
+            "/state",
+            "/state_name",
+            "/fault_flags",
+            "/last_command_seq",
+        }),
+        timeout=5,
+    ),
+    "set_status_light_scene": TaskSpec(
+        description="设置机器人状态灯场景",
+        params={
+            "scene": ParamRule(
+                ("string", "integer"),
+                required=True,
+            ),
+            "ambient": ParamRule(("string", "integer")),
+            "restart_pattern": ParamRule(("boolean",)),
+            "verify": ParamRule(("boolean",)),
+            "timeout": ParamRule(("number",)),
+        },
+        timeout=5,
+    ),
+    "get_status_light_state": TaskSpec(
+        description="查询状态灯实际执行状态",
+        params={},
+        output_paths=frozenset({
+            "/success",
+            "/valid",
+            "/scene",
+            "/scene_name",
+            "/ambient",
+            "/control_mode",
+        }),
+        timeout=5,
+    ),
+    "get_rgb_light_strip_state": TaskSpec(
+        description="读取内存中缓存的RGB灯带状态",
+        params={},
+        output_paths=frozenset({
+            "/success",
+            "/rgb_switch",
+            "/rgb_mode",
+            "/brightness",
+            "/color",
+            "/color_name",
+        }),
+        timeout=2,
+    ),
+    "set_rgb": TaskSpec(
+        description="设置RGB灯开关、模式和颜色",
+        params={
+            "switch": ParamRule(("boolean",)),
+            "mode": ParamRule(("integer",)),
+            "color": ParamRule(("string",)),
+        },
+        timeout=5,
+    ),
+    "wake_turn_to_person": TaskSpec(
+        description="头部按声源方向转向说话人",
+        params={
+            "angle": ParamRule(("number",)),
+            "turn_speed": ParamRule(("integer",)),
+        },
+        timeout=30,
+    ),
+    "forward_head": TaskSpec(
+        description="头部前倾关切",
+        params={
+            "angle": ParamRule(("number",)),
+            "turn_speed": ParamRule(("integer",)),
+        },
+        timeout=30,
+    ),
+}
+其他高层工具按照同样方式补充。
+关键原则是：
+- 工具名、参数、输出字段由程序登记。
+- LLM只能在登记表中选择。
+- LLM不能自己声明某个任务可以并行。
+- LLM不能自己发明输出字段。
+
+---
+八、PlanDraft格式
+复杂指令的LLM输出统一为：
+{
+  "intent": "execute",
+  "goal": "打开药箱，确认打开后找到张三，然后回到门口",
+  "steps": [
+    {
+      "id": "open_box",
+      "title": "打开药箱",
+      "type": "set_medicine_box_command",
+      "params": {
+        "command": "open"
+      },
+      "depends_on": []
+    },
+    {
+      "id": "check_box",
+      "title": "确认药箱状态",
+      "type": "get_medicine_box_status",
+      "params": {},
+      "depends_on": ["open_box"],
+      "expect": {
+        "path": "/state_name",
+        "op": "eq",
+        "value": "open"
+      }
+    },
+    {
+      "id": "find_zhang",
+      "title": "寻找张三",
+      "type": "go_find_person",
+      "params": {
+        "obj_name": "张三",
+        "user_prompt": "找到张三"
+      },
+      "depends_on": ["check_box"]
+    },
+    {
+      "id": "return_door",
+      "title": "返回门口",
+      "type": "go_to_door",
+      "params": {},
+      "depends_on": ["find_zhang"]
+    }
+  ],
+  "reason": ""
+}
+这里：
+- id：本次计划内部的步骤名。
+- title：中文AgentLog使用。
+- type/params：直接对应当前代码。
+- depends_on：业务依赖，不是硬件资源冲突。
+- expect：规定工具返回什么结果才算真正成功。
+
+---
+九、一次性生成全部步骤和depends_on的Prompt
+核心是：
+1. 把可用工具和参数全部给模型。
+2. 明确要求一次返回完整JSON。
+3. 禁止边生成边执行。
+4. 要求模型区分业务依赖和资源冲突。
+5. 编译通过前机器人不执行任何动作。
+建议Prompt如下。
+6. import json
+def build_planner_prompt(task_specs: dict[str, TaskSpec]) -> str:
+    tool_catalog = []
+    for task_type, spec in task_specs.items():
+        if task_type not in PLANNER_VISIBLE_TYPES:
+            continue
+        params = {}
+        for name, rule in spec.params.items():
+            params[name] = {
+                "types": list(rule.kinds),
+                "required": rule.required,
+                "enum": list(rule.enum) if rule.enum else None,
+            }
+        tool_catalog.append({
+            "type": task_type,
+            "description": spec.description,
+            "params": params,
+            "output_paths": sorted(spec.output_paths),
+        })
+    catalog_json = json.dumps(
+        tool_catalog,
+        ensure_ascii=False,
+        indent=2,
+    )
+    return f"""
+你是一个实体机器人的任务规划器。
+你的职责只有一个：
+把用户的一段复杂自然语言指令，一次性转换成完整、有限、
+无循环的任务依赖图。你不能执行任何任务。
+可使用的机器人任务如下：
+{catalog_json}
+必须遵守以下规则：
+只允许使用上面列出的type，禁止创造新工具。
+必须一次性返回完整计划，不能只返回第一步。
+每个步骤必须包含：
+id、title、type、params、depends_on。
+id只能使用小写英文字母、数字和下划线，并且必须唯一。
+depends_on表示业务上的成功依赖：
+只有依赖步骤成功，当前步骤才能开始。
+两个任务只是因为都使用机器人硬件，不需要人为增加depends_on；
+物理串行由程序的physical_lock处理。
+真正相互独立的任务应该拥有相同的前置条件，
+让程序有机会并行执行。
+用户说“确认、确保、检查”时，必须生成查询步骤，
+并使用expect声明期望的工具结果。
+禁止在计划中生成：
+stop_move、pause_move、emergency_stop、
+stop_follow、stop_navigate。
+禁止省略用户目标中的必要动作。
+如果缺少完成用户目标的工具：
+intent必须返回unsupported，steps必须为空，
+reason说明缺少什么能力。
+如果必须向用户询问信息：
+intent返回clarify，steps为空，
+reason写出需要询问的问题。
+步骤最多12个。
+禁止循环依赖。
+不要输出Python、Markdown、解释文字或思维过程。
+只返回一个JSON对象。
+返回格式：
+{{
+  "intent": "execute | clarify | unsupported",
+  "goal": "规范化后的用户目标",
+  "steps": [
+    {{
+      "id": "step_name",
+      "title": "简短中文步骤说明",
+      "type": "已登记的工具类型",
+      "params": {{}},
+      "depends_on": [],
+      "expect": {{
+        "path": "/结果字段",
+        "op": "eq | ne | exists | in | gt | gte | lt | lte",
+        "value": "期望值"
+      }}
+    }}
+  ],
+  "reason": ""
+}}
+没有结果条件的步骤不要输出expect。
+"""
+
+---
+十、compile_plan()
+输入是LLM生成的计划草稿，输出是程序确认可以运行的计划。
+它主要检查：
+1. 计划是不是合法JSON结构。
+2. 每个步骤是否有唯一名称。
+3. type是不是机器人已有工具。
+4. params参数是否齐全、类型是否正确。
+5. depends_on引用的步骤是否存在。
+6. 步骤是否依赖自己。
+7. 是否有循环依赖。
+8. expect使用的结果字段是否真实存在。
+9. 是否把stop_move等控制命令放进了普通计划。
+10. 给每一步注入physical或parallel，不相信LLM的分类。
+compile_plan()核心代码
+def compile_plan(draft):
+    if not isinstance(draft, dict):
+        raise PlanError("计划必须是JSON对象")
+    steps = draft.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise PlanError("steps必须是非空列表")
+    if len(steps) > 12:
+        raise PlanError("计划步骤不能超过12个")
+    step_ids = set()
+    # 第一轮：检查每个步骤本身
+    for step in steps:
+        step_id = step.get("id")
+        task_type = step.get("type")
+        params = step.get("params", {})
+        dependencies = step.get("depends_on", [])
+        if not step_id or step_id in step_ids:
+            raise PlanError(f"步骤id无效或重复：{step_id}")
+        step_ids.add(step_id)
+        if task_type not in PLANNER_VISIBLE_TYPES:
+            raise PlanError(f"不允许使用工具：{task_type}")
+        if task_type in CONTROL_TYPES:
+            raise PlanError("stop等控制命令不能进入普通计划")
+        validate_params(
+            task_type,
+            params,
+            TASK_SPECS[task_type],
+        )
+        if not isinstance(dependencies, list):
+            raise PlanError("depends_on必须是列表")
+        if step_id in dependencies:
+            raise PlanError(f"{step_id}不能依赖自己")
+    # 第二轮：检查依赖目标是否存在
+    for step in steps:
+        for dependency in step["depends_on"]:
+            if dependency not in step_ids:
+                raise PlanError(
+                    f"{step['id']}依赖不存在的步骤："
+                    f"{dependency}"
+                )
+    # 第三轮：拓扑排序检查循环
+    topological_order = topological_sort(steps)
+    # 第四轮：由程序注入执行分类
+    compiled_steps = []
+    for index, step in enumerate(steps):
+        task_type = step["type"]
+        compiled_steps.append({
+            **step,
+            "_execution": (
+                "parallel"
+                if task_type in PARALLEL_TYPES
+                else "physical"
+            ),
+            "_order": index,
+            "_timeout": TASK_SPECS[task_type].timeout,
+        })
+    return {
+        "goal": draft["goal"],
+        "steps": compiled_steps,
+        "_topological_order": topological_order,
+    }
+循环依赖检查核心：
+def topological_sort(steps):
+    indegree = {
+        step["id"]: len(step["depends_on"])
+        for step in steps
+    }
+    children = {
+        step["id"]: []
+        for step in steps
+    }
+    for step in steps:
+        for dependency in step["depends_on"]:
+            children[dependency].append(step["id"])
+    ready = [
+        step_id
+        for step_id, count in indegree.items()
+        if count == 0
+    ]
+    result = []
+    while ready:
+        step_id = ready.pop(0)
+        result.append(step_id)
+        for child in children[step_id]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if len(result) != len(steps):
+        raise PlanError("计划存在循环依赖")
+    return result
+
+---
+十一、ready步骤到底是什么
+一个步骤是ready，需要同时满足：
+步骤状态仍然是PENDING
++
+depends_on中的所有步骤都是SUCCEEDED
++
+没有收到stop_move
+核心判断只有这一段：
+ready = [
+    step
+    for step in steps
+    if (
+        states[step["id"]] == "pending"
+        and all(
+            states[dependency] == "succeeded"
+            for dependency in step["depends_on"]
+        )
+    )
+]
+例如：
+A：打开药箱，无依赖
+B：读取RGB状态，无依赖
+C：检查药箱，依赖A
+D：找张三，依赖C
+E：返回门口，依赖D
+初始：
+A ready，physical
+B ready，parallel
+C 不ready
+D 不ready
+E 不ready
+所以A和B可以一起开始。
+A完成后：
+C的所有依赖成功
+→ C变成ready
+C结果满足 state_name == open 后：
+D变成ready
+
+---
+十二、run_plan()核心代码
+run_plan()负责真正按照依赖执行。
+它不断重复以下过程：
+查找ready步骤
+→ 启动一个物理步骤
+→ 启动最多四个安全并行步骤
+→ 等待任意步骤完成
+→ 保存结果
+→ 重新计算ready步骤
+步骤成为ready需要：
+当前状态是PENDING
++
+所有depends_on步骤都是SUCCEEDED
++
+没有收到stop_move
+例如：
+A：打开药箱
+B：检查药箱，依赖A
+C：读取RGB缓存
+D：找张三，依赖B
+最开始：
+A ready
+C ready
+B、D不ready
+所以：
+A拿physical_lock
+C使用parallel_slots
+A和C可以同时运行
+A成功后B才ready。B结果满足药箱已打开后，D才ready。
+run_plan()核心代码
+async def run_plan(self, plan):
+    states = {
+        step["id"]: "pending"
+        for step in plan["steps"]
+    }
+    results = {}
+    running = {}
+    while True:
+        if self.stop_event.is_set():
+            break
+        pending = [
+            step
+            for step in plan["steps"]
+            if states[step["id"]] == "pending"
+        ]
+        if not pending and not running:
+            break
+        ready = [
+            step
+            for step in pending
+            if all(
+                states[dependency] == "succeeded"
+                for dependency in step["depends_on"]
+            )
+        ]
+        physical_running = any(
+            step["_execution"] == "physical"
+            for step in running.values()
+        )
+        # 最多启动一个物理任务
+        if not physical_running:
+            physical_step = next(
+                (
+                    step
+                    for step in ready
+                    if step["_execution"] == "physical"
+                ),
+                None,
+            )
+            if physical_step:
+                states[physical_step["id"]] = "running"
+                task = asyncio.create_task(
+                    self.run_step(physical_step)
+                )
+                running[task] = physical_step
+        # 最多启动四个并行任务
+        parallel_running = sum(
+            step["_execution"] == "parallel"
+            for step in running.values()
+        )
+        available = 4 - parallel_running
+        for step in [
+            item
+            for item in ready
+            if item["_execution"] == "parallel"
+            and states[item["id"]] == "pending"
+        ][:available]:
+            states[step["id"]] = "running"
+            task = asyncio.create_task(
+                self.run_step(step)
+            )
+            running[task] = step
+        if not running:
+            raise RuntimeError("计划依赖无法继续")
+        done, _ = await asyncio.wait(
+            running,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            step = running.pop(task)
+            outcome = task.result()
+            states[step["id"]] = outcome["state"]
+            results[step["id"]] = outcome
+            if outcome["state"] != "succeeded":
+                self.stop_event.set()
+                break
+    return {
+        "success": all(
+            state == "succeeded"
+            for state in states.values()
+        ),
+        "states": states,
+        "results": results,
+    }
+执行一个步骤：
+async def run_step(self, step):
+    guard = (
+        self.parallel_slots
+        if step["_execution"] == "parallel"
+        else self.physical_lock
+    )
+    async with guard:
+        if self.stop_event.is_set():
+            return {
+                "state": "canceled",
+                "error_msg": "计划已停止",
+            }
+        result = await self.agent.execute_task({
+            "type": step["type"],
+            "params": step["params"],
+        })
+    if result.get("success") is not True:
+        return {
+            "state": "failed",
+            "result": result,
+            "error_msg": result.get(
+                "error_msg",
+                "任务执行失败",
+            ),
+        }
+    if not check_expect(
+        result,
+        step.get("expect"),
+    ):
+        return {
+            "state": "failed",
+            "result": result,
+            "error_msg": "任务结果不符合预期",
+        }
+    return {
+        "state": "succeeded",
+        "result": result,
+        "error_msg": "",
+    }
+实际版本还要在结束时等待已经启动的任务退出，并给未启动步骤标记 skipped/canceled。
+
+---
+十三、WebSocket入口怎样分流
+未来在当前读取完：
+task_type = data.get("type")
+task_params = data.get("params", {})
+之后进行：
+if task_type == "stop_move":
+    result = await orchestrator.stop_current_plan(
+        task_params.get(
+            "user_prompt",
+            "停止当前任务",
+        )
+    )
+elif task_type == "natural_language":
+    user_prompt = task_params.get(
+        "user_prompt",
+        "",
+    )
+    draft = await generate_plan(
+        agent,
+        user_prompt,
+    )
+    compiled = compile_plan(draft)
+    if compiled["intent"] == "clarify":
+        result = {
+            "type": "natural_language",
+            "success": False,
+            "needs_input": True,
+            "error_msg": compiled["reason"],
+        }
+    elif compiled["intent"] == "unsupported":
+        result = {
+            "type": "natural_language",
+            "success": False,
+            "error_msg": compiled["reason"],
+        }
+    else:
+        result = await orchestrator.run_plan(
+            compiled
+        )
+elif task_type in PARALLEL_TYPES:
+    async with orchestrator.parallel_slots:
+        result = await agent.execute_task({
+            "type": task_type,
+            "params": task_params,
+        })
+elif task_type in PHYSICAL_TYPES:
+    one_step_plan = {
+        "intent": "execute",
+        "goal": f"执行{task_type}",
+        "response_type": task_type,
+        "steps": [{
+            "id": "single_step",
+            "title": f"执行{task_type}",
+            "type": task_type,
+            "params": task_params,
+            "depends_on": [],
+            "expect": None,
+            "_execution": "physical",
+            "_timeout": 120,
+            "_order": 0,
+        }],
+    }
+    result = await orchestrator.run_plan(
+        one_step_plan
+    )
+else:
+    result = {
+        "type": task_type or "unknown",
+        "success": False,
+        "error_msg": "不支持的任务类型",
+    }
+正式代码中，自然语言规划开始前就应占用 active_plan，这样另一个普通任务不能在LLM规划期间插入。stop仍可以设置同一个 stop_event，从而做到：
+模型还在生成计划
+→ 用户发送stop_move
+→ 计划标记停止
+→ 模型即使随后返回
+→ 机器人也不会开始第一步
+
+---
+十四、当前同步阻塞必须处理
+一把物理锁解决的是“两个任务争机器人”，不能解决“事件循环被同步函数卡住”。
+当前例如：
+elif task_type == "find_person":
+    return self.ros2_interface.find_person(...)
+find_person() 内部可能等待ROS服务30秒。在这30秒内，stop消息可能无法及时执行。
+过渡改法是将经过确认可在线程执行的同步函数放入 asyncio.to_thread()：
+import functools
+async def run_sync(function, *args, **kwargs):
+    call = functools.partial(
+        function,
+        *args,
+        **kwargs,
+    )
+    return await asyncio.to_thread(call)
+这时过程变成：
+主事件循环把同步ROS函数交给工作线程
+→ 主事件循环立即空闲
+→ 可以继续处理stop_move
+→ 工作线程完成后返回结果
+例如：
+elif task_type == "find_person":
+    return await run_sync(
+        self.ros2_interface.find_person,
+        params.get("obj_name", ""),
+        params.get("user_prompt", ""),
+    )
+药箱查询：
+elif task_type == "get_medicine_box_status":
+    result = await run_sync(
+        self.ros2_interface.get_medicine_box_status
+    )
+    result["type"] = task_type
+    return result
+优先处理：
+- find_person
+- _call_ros2_service_async()中的同步轮询
+- _call_ros2_service()外部命令调用
+- 药箱和灯光里的time.sleep()
+- navigate_to_position()
+- 所有可能等待数秒的同步工具
+长期更合适的是把长物理操作改为真正的ROS2 Action，但不影响当前编排架构。
+
+---
+十五、一个包含并行的完整例子
+用户输入：
+{
+  "type": "natural_language",
+  "params": {
+    "user_prompt": "打开药箱，同时读取RGB灯状态；确认药箱打开后找到张三，然后回门口"
+  }
+}
+LLM输出逻辑：
+open_box：打开药箱，无依赖，physical
+read_rgb：读取RGB缓存，无依赖，parallel
+check_box：依赖open_box，physical
+find_zhang：依赖check_box，physical
+return_door：依赖find_zhang，physical
+调度过程：
+第一轮ready：
+open_box + read_rgb
+实际启动：
+open_box拿physical_lock
+read_rgb拿一张parallel票
+两者并行
+open_box成功后：
+check_box变成ready
+check_box返回state_name=open后：
+find_zhang变成ready
+find_zhang成功后：
+return_door变成ready
+如果药箱状态返回：
+{
+  "success": true,
+  "state_name": "closed"
+}
+虽然ROS查询成功，但 expect 不成立：
+/state_name 实际为closed
+要求eq open
+计划就会停止，不会寻找张三。
+
+---
+十六、推荐实施顺序
+1. 先建立完整的51项分类表和启动断言。
+2. 建立 SimpleOrchestrator 的一把锁、四个并行和当前计划变量。
+3. 不接LLM，使用手写计划测试 run_plan()。
+4. 测试两个物理任务绝不重叠。
+5. 测试 get_rgb_light_strip_state 能与物理任务并行。
+6. 测试导航期间 stop_move 能插入。
+7. 测试stop后不再启动下一步。
+8. 建立 TASK_SPECS，先登记常用高层工具。
+9. 接入Planner Prompt，只做dry-run并打印计划。
+10. 接入 compile_plan()，错误计划全部拒绝。
+11. 编译通过后才允许调用真实机器人。
+12. 处理同步阻塞函数，验证stop延迟。
+13. 拆分真正的只读数据库和内存状态工具。
+14. 最后再考虑最多一次有限重新规划。
+这套方案可以实现复杂指令拆解、依赖确定、结构逻辑检查、结果条件检查、物理串行、安全查询并行、stop插入和中文AgentLog，同时继续使用你现在的 type/params 和 agent.execute_task()。
+
+1. 解决无网、弱网和分类问题
+外层 type 用程序判断，不用 LLM：
+stop_move → 直接停止
+已知type → 直接执行
+natural_language → 才进入规划
+未知type → 直接拒绝
+自然语言规划采用：
+→ 本地LLM
+→ 可选云端LLM
+→ 都不可用则失败，不执行机器人
+→ 固定模板
+准备少量高频模板：
+open_box_and_check
+打开药箱 → 确认状态
+find_person_and_return
+找指定人员 → 返回门口
+find_object_and_return
+找指定物品 → 返回原位置
+open_box_find_person_return
+打开药箱 → 确认 → 找人 → 回门口
+patrol_and_reset_head
+执行巡检 → 头部回正
+1. 统一同义词
+   开启 → 打开
+   返回 → 回
+
+2. 检查模板特征
+   有“打开药箱”
+   有“检查”
+   有“找”
+   有“回门口”
+
+3. 从名册中提取到“张三”
+
+4. 调用模板函数
+   build_open_box_find_person_return("张三")
+
+5. 得到完整PlanDraft
+
+6. 继续调用compile_plan()
+
+7. 通过后调用run_plan()
+2. 解决DAG状态、中断和继续问题
+在编排器中增加一份 PlanRuntime 记录：
+当前计划状态
+每一步状态
+每一步执行结果
+当前运行步骤
+停止原因
+步骤状态简单使用：
+pending / running / succeeded / failed / interrupted
+收到 stop_move：
+禁止启动新步骤
+→ 调用现有stop_move
+→ 保存当前步骤状态和结果
+→ 计划标记为interrupted
+如果需要继续，增加：
+{"type":"resume_plan","params":{}}
+恢复时先重新查询机器人真实状态，再继续剩余步骤。
+同进程内可以只保存在内存；以后需要断电恢复，再保存到 SQLite。AgentMemory只保存“完成了什么、观察到什么”，不负责控制执行状态。
+3. 解决执行结果与计划不一致
+每个步骤执行后统一做：
+工具结果
+→ success检查
+→ expect检查
+→ 决定继续、重试、换方法或停止
+- 查询超时：最多重试一次。
+- 固定替代：例如本地 find_person失败后，改用 go_find_person。
+如果仍解决不了，最多允许 LLM局部重新规划一次，并且新步骤必须再次通过 compile_plan()。
+最后不能只检查所有步骤是否 success，还要检查用户目标是否真正满足，例如“确认药箱打开”必须有查询结果证明药箱状态为 open。
+最终简化流程
+type/params
+    ↓
+程序分流
+    ↓
+本地LLM /云LLM /模板 
+    ↓
+compile_plan()
+    ↓
+服务可用性检查
+    ↓
+PlanRuntime记录状态
+    ↓
+run_plan()
+    ↓
+执行结果 + expect检查
+    ├── 正常 → 下一步
+    ├── 可恢复 → 验证或重试
+    ├── 可替代 → 固定替代
+    └── 无法处理 → 停止
+Motion Agent 按语义意图路由的设计
+[图片]
+“自然语言”只是输入形式，并不代表一定需要复杂规划。例如：
+“马上停下”             → 自然语言，但不应进入规划
+“药箱现在打开了吗”     → 自然语言，但只是查询
+“打开药箱”             → 自然语言，但只是单动作
+“打开药箱确认后找张三” → 才是真正的复杂目标规划
+“你好”                 → 自然语言，但只是聊天
+新分类
+将请求归一化为五种内部意图：
+CONTROL：控制
+QUERY：查询
+ACTION：单动作
+GOAL：复杂目标动作
+CHAT：聊天问答
+另外增加两个非执行结果：
+CLARIFY：需要用户补充信息
+UNSUPPORTED：机器人没有对应能力
+整体架构
+结构化JSON / 自然语言
+          │
+          ▼
+     本地安全识别（规则）慎重
+          │
+          ├── 识别到“停止、停下、别动”等字段
+          │          ↓
+          │      CONTROL
+          │          ↓
+          │   立即执行stop_move
+          │
+          └── 未识别到停止意图
+                     ↓
+            IntentResolver
+              意图归一化
+                     ↓
+        ┌──────────────────────┐
+        │ QUERY                │ → 查询工具，允许安全并行
+        │ ACTION               │ → 生成单步骤计划
+        │ GOAL                 │ → 模板/大模型规划
+        │ CHAT                 │ → 大模型回答，不调用机器人
+        │ CLARIFY              │ → 询问用户
+        │ UNSUPPORTED          │ → 说明机器人能力不足
+        └──────────────────────┘
+   非自然语言按原计划
+         ↓
+compile_plan()
+    ↓
+服务可用性检查
+    ↓
+PlanRuntime记录状态进sqlite等文档，langraph
+    ↓
+run_plan()
+    ↓
+执行结果 + expect检查
+    ├── 正常 → 下一步
+    ├── 可恢复 → 验证或重试
+    ├── 可替代 → 固定替代
+    └── 无法处理 → 停止
+
+本地安全识别
+本地安全识别位于 IntentResolver 之前，只负责识别必须立即处理的停止意图，例如：
+停下
+马上停止
+别动
+不要继续
+停止移动
+终止当前任务
+IntentResolver 的功能
+没有命中停止意图的请求，再交给 IntentResolver 判断真实意图。
+暂时无法在i讯飞文档外展示此内容
+IntentResolver 可以按照以下顺序工作：
+固定规则
+    ↓ 无法确定
+固定模板
+    ↓ 仍无法确定
+大模型识别
+所有任务统一进入计划执行
+除 CONTROL外，所有会调用机器人工具的请求都转换成计划。
+QUERY 查询任务
+例如：
+“药箱打开了吗”
+转换为单步骤查询计划：
+get_medicine_box_status
+查询任务经过确认安全后，可以使用并行执行额度。
+ACTION 单动作任务
+例如：
+“打开药箱”
+转换为单步骤动作计划：
+set_medicine_box_command
+虽然只有一个步骤，仍然经过编译和物理锁控制。
+GOAL 复杂目标
+例如：
+“打开药箱，确认后找到张三”
+转换为多步骤 DAG：
+打开药箱
+    ↓
+查询并确认药箱状态
+    ↓
+寻找张三
+三种计划最终统一经过：
+compile_plan()
+→ 参数、工具、依赖、权限和结果条件检查
+→ run_plan()
+→ 物理锁、并行额度、状态和结果管理
+→ agent.execute_task()
+这样直接任务和复杂任务能够共用相同的锁、超时、日志、停止和失败策略。
+
+CLARIFY 和 UNSUPPORTED
+CLARIFY
+当完成任务所需的信息不足时，不生成计划。
+例如：
+用户：找到他
+系统不知道“他”是谁，返回：
+{
+  "intent":"clarify",
+  "reason":"请说明需要寻找哪位人员",
+  "steps":[]
+}
+UNSUPPORTED
+当用户目标明确，但机器人没有对应工具时，返回能力不足。
+例如：
+用户：找到张三以后把药递给他
+如果当前只有找人和导航工具，没有交付工具，则返回：
+{
+  "intent":"unsupported",
+  "reason":"当前缺少药品交付和交付结果确认能力",
+  "steps":[]
+}
