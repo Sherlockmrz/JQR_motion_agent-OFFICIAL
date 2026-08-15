@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Motion Agent 文档集</title>
+  <link rel="stylesheet" href="assets/document.css">
+</head>
+<body>
+  <header class="topbar">
+    <strong>JQR Motion Agent · OFFICIAL</strong>
+    <nav><a href="../../README.md">仓库 README</a></nav>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">DOCUMENT ARCHIVE</div>
+      <h1>Motion Agent 文档集</h1>
+      <p>Motion Agent 与 Kinbot Agent 的原始说明、架构图、流程图和开发计划。原文保存在 sources 中，HTML只负责整理展示。</p>
+    </section>
+
+    <section class="index-grid">
+      <a class="index-card" href="01_agent_log_trace_memory_planning.html">
+        <h2>01 · 日志、Trace与长期演进</h2>
+        <p>7月15日找人找物主线、日志易读化、Trace评分、AgentMemory、Planning与Skills。</p>
+      </a>
+      <a class="index-card" href="02_complex_task_orchestration.html">
+        <h2>02 · 复杂任务编排</h2>
+        <p>PlanDraft、compile_plan、ready步骤、物理锁、并行槽和LangGraph执行图。</p>
+      </a>
+      <a class="index-card" href="03_robot_mcu_integration_test_20260721.html">
+        <h2>03 · MCU真机联调报告</h2>
+        <p>灯光、药箱与clear_fault的Agent→Base→SDK→MCU真实链路测试。</p>
+      </a>
+      <a class="index-card" href="04_motion_agent_architecture_and_prediction.html">
+        <h2>04 · 总体架构与下一任务预判</h2>
+        <p>输入、LLM/JSON解析、任务路由、执行通道、结果回传和长期任务连接规则。</p>
+      </a>
+      <a class="index-card" href="05_kinbot_agent_development_plan.html">
+        <h2>05 · Kinbot Agent开发计划</h2>
+        <p>交互软件进展、开发工作流、目标架构、模块职责、Agentic System与代办结论。</p>
+      </a>
+    </section>
+
+    <section class="gallery">
+      <article class="gallery-card">
+        <img src="assets/agent_system_architecture.png" alt="Motion Agent总体架构图">
+        <div class="body"><strong>Motion Agent总体架构</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/langgraph_execution_graph.png" alt="LangGraph任务执行图">
+        <div class="body"><strong>LangGraph任务执行图</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/find_person_sequence.png" alt="找人链路时序图">
+        <div class="body"><strong>找人任务端到端时序图</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/kinbot_l1_agent_skill_architecture.png" alt="Kinbot L1基础业务Agent与Skill跨空间互连视图">
+        <div class="body"><strong>Kinbot L1 Agent与Skill目标架构</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/agentic_system_voice_workflow.png" alt="Agentic System语音与多Agent调度流程">
+        <div class="body"><strong>Agentic System语音交互流程</strong></div>
+      </article>
+      <article class="gallery-card">
+        <img src="assets/kinbot_console_tui.png" alt="Kinbot Rust Agent Console界面">
+        <div class="body"><strong>Kinbot Agent Console与调试命令</strong></div>
+      </article>
+    </section>
+  </main>
+  <footer>原文与原图均保存在本目录，可离线归档。</footer>
+</body>
+</html>

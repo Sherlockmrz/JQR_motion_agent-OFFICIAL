@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>复杂自然语言任务编排设计</title>
+  <link rel="stylesheet" href="assets/document.css">
+</head>
+<body>
+  <header class="topbar">
+    <strong>02 · 复杂任务编排</strong>
+    <nav><a href="01_agent_log_trace_memory_planning.html">上一篇</a><a href="index.html">文档首页</a><a href="03_robot_mcu_integration_test_20260721.html">下一篇</a></nav>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">ORIGINAL DOCUMENT · 1297 LINES</div>
+      <h1>基于现有Motion Agent的复杂任务编排</h1>
+      <p>复杂自然语言一次生成PlanDraft，经compile_plan安全编译后，由LangGraph节点调度ready步骤并调用原有execute_task能力。</p>
+    </section>
+
+    <figure class="figure tall">
+      <img src="assets/langgraph_execution_graph.png" alt="LangGraph真实节点执行图">
+      <figcaption>原图：generate_plan、compile_plan、execute_plan、schedule_steps、控制节点、执行节点与finalize</figcaption>
+    </figure>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <h2>原文章节</h2>
+        <div id="toc" class="toc"></div>
+      </aside>
+      <article class="paper">
+        <div class="toolbar">
+          <button id="toggle-view">查看完整原文</button>
+          <button id="copy-source">复制原文</button>
+          <input id="search-source" type="search" placeholder="筛选原文行">
+          <a class="button" href="sources/02_complex_task_orchestration.txt">打开原始文本</a>
+        </div>
+        <div id="load-status" class="status">正在载入原文…</div>
+        <section id="document-content"></section>
+        <pre id="raw-content" class="raw-source hidden"></pre>
+      </article>
+    </div>
+  </main>
+  <script>window.DOC_CONFIG = { source: "sources/02_complex_task_orchestration.txt" };</script>
+  <script src="assets/document-viewer.js"></script>
+</body>
+</html>

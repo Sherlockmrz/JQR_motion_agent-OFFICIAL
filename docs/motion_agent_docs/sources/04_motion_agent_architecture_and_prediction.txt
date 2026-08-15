@@ -1,0 +1,288 @@
+Motion Agent 整体架构与下一任务预判
+
+Motion Agent 是机器人运动系统的调度中心。它接收自然语言或 JSON 任务，把任务统一成内部格式，然后根据 type 决定下一步：
+
+输入入口 → LLM/JSON解析 → 任务路由器 → 不同执行通道 → 结果回传
+
+一、输入入口
+
+输入入口接收来自测试脚本、上层交互系统或 WebSocket 控制端的消息。
+
+{
+  "type": "go_find_person",
+  "params": {
+    "obj_name": "张三",
+    "user_prompt": "请去找张三"
+  }
+}
+
+或者一句自然语言：
+
+请去找张三
+
+处理逻辑：
+- 如果有 type，并且 type 是代码里已知任务，进入任务路由器。
+- 如果没有 type，把自然语言交给 LLM 分析。
+- 如果有 type 但不是已知任务，也会交给 LLM 尝试重新归类。
+
+二、LLM任务拆解
+
+LLM 用来把自然语言或未知任务转换成标准 JSON。
+
+用户说：去找张三
+
+LLM 应该输出类似：
+
+{
+  "type": "go_find_person",
+  "params": {
+    "obj_name": "张三",
+    "user_prompt": "去找张三"
+  }
+}
+
+三、JSON容错解析
+
+线上模型有时不会只返回纯 JSON，可能返回 Markdown 代码块。JSON 容错解析模块负责把真正的 JSON 提取出来，再交给任务路由器。
+
+四、任务路由器
+
+任务路由器根据 type 把任务分到不同执行通道：
+
+known_task_types
+_execute_task_by_type(task_type, params)
+
+如果是导航类任务，通常走 VLN；状态查询、电机控制、停止任务走本地 ROS2/电机接口；完全不认识的任务进入 LLM 兜底或返回错误。
+
+1. VLN导航任务
+
+go_to_object
+go_find_person
+follow_person
+
+示例输入：
+
+{
+  "type": "go_find_person",
+  "params": {
+    "obj_name": "张三",
+    "user_prompt": "请去找张三"
+  }
+}
+
+Motion Agent 转换为 VLN 协议：
+
+{
+  "type": "go_to_person",
+  "user_prompt": "请去找张三",
+  "person_id": "张三"
+}
+
+发送到：
+
+ws://127.0.0.1:8000/ws/navigate
+
+VLN 返回实时动作，例如：
+
+{
+  "command": "右转55度"
+}
+
+实时动作反馈给 Motion Agent，用于日志、上层展示或导航进度记录；VLN 同时调用导航和底盘执行链路，让机器人真实运动。
+
+2. 查找与感知任务
+
+find_object
+find_person
+delete_person
+
+- find_object：先查 ASM JSON，再查历史数据库 history.db。
+- find_person：通过相机图像和人脸识别服务查人。
+- delete_person：通过 ROS2 接口删除人员信息。
+
+3. ROS2状态与外设任务
+
+get_move_mode
+get_medicine_box_state
+set_medicine_box_switch
+get_robot_rise_state
+set_robot_rise_jqr
+get_robot_tilt_state
+set_robot_tilt_jqr
+get_screen_tilt_state
+set_screen_tilt_jqr
+set_laser_pointer
+get_laser_pointer_state
+set_rgb
+get_rgb_light_strip_state
+set_chassis_rotate_params
+
+这类任务通常不需要 VLN 推理，直接调用 ROS2 service/topic 查询或设置机器人状态。
+
+4. 本地运动、电机与场景任务
+
+back_to_last_position
+go_to_door
+set_head_motor_control
+set_combine_motor_control
+set_four_combine_motor_control
+set_four_combine_waypoint_control
+keyboard_motor_control
+user_position_tracking
+patrol_table_inspection
+wake_head_range
+wake_beyond_head_range
+wake_side_moving
+wake_back_moving
+obstacle_avoidance_turn
+move_forward_with_head_sweep
+four_dof_head_sequence
+head_sweep_sequence
+head_reset_to_zero
+
+这类任务由机器人本地直接执行，一般通过 ROS2 topic/service 或本地电机接口完成。
+
+5. 停止与中断任务
+
+stop_follow
+stop_navigate
+stop_move
+emergency_stop
+
+- stop_follow：停止跟随任务。
+- stop_navigate：停止导航任务。
+- stop_move：停止本地移动。
+- emergency_stop：发布零速度，停止底盘和头部/组合电机动作，并清空活跃导航任务。
+
+6. 未知任务或自然语言兜底
+
+{
+  "type": "dance",
+  "params": {
+    "style": "random"
+  }
+}
+
+处理过程：
+1. Agent 发现 dance 不在 known_task_types 中。
+2. Agent 交给 LLM 分析。
+3. 如果 LLM 转换成已知任务，例如 head_sweep_sequence，则继续执行。
+4. 如果 LLM 返回 default，作为普通问答返回。
+5. 如果仍是不支持的任务类型，返回错误。
+
+{
+  "success": false,
+  "error_msg": "不支持的任务类型: dance"
+}
+
+五、下一任务预判机制
+
+1. 功能
+
+建立长期记忆库，记录用户经常连续执行的任务关系，例如：
+
+找到张三 → 返回门口：5次
+找到张三 → 打开药箱：4次
+找到张三 → 头部回正：1次
+
+任务 A 完成后，如果用户没有发出新指令，则查询长期记忆，判断是否询问或自动执行后续任务。
+
+2. 任务连接如何记录
+
+连接来自两种情况：
+
+1. 同一个复杂计划内部，根据 depends_on 记录 A → B。
+2. 两次独立任务之间，A完成后用户执行B，并且B成功，则A → B次数加一。
+
+复杂计划不能按照任务完成时间记录，否则并行任务可能产生错误连接，必须按照 depends_on 关系记录。
+
+3. 预判规则
+
+任务A成功
+↓
+等待3秒
+↓
+用户发出任务B
+├── 取消预测
+├── 正常执行B
+└── B成功后记录A → B
+↓
+用户没有发出新任务
+└── 查询A的后续候选
+
+没有候选：
+→ 不处理，继续等待用户。
+
+只有一个候选：
+→ 出现不足3次：询问用户。
+→ 出现3次及以上：自动执行。
+→ 用户曾明确同意过：自动执行。
+
+存在多个候选：
+→ 第一名和第二名次数相差不超过3次：询问用户。
+→ 第一名比第二名多3次及以上：自动执行第一名。
+
+例子：
+
+A → B：5次
+A → C：4次
+
+次数接近，询问用户执行B还是C。
+
+A → B：6次
+A → C：3次
+
+B明显更常见，可以自动执行B。
+
+4. 用户修改记忆
+
+“这次不要”
+→ 只跳过本次，不删除长期记忆。
+
+“以后不要在A后执行B”
+→ 删除A → B。
+
+“以后A后改成执行C”
+→ 删除A → B，增加并确认A → C。
+
+删除后的连接不是永久禁止。如果以后再次多次出现A → B，系统仍可重新建立连接。
+
+5. 接入复杂任务编排的位置
+
+run_plan()
+↓
+步骤success和expect检查通过
+↓
+记录复杂计划内部A → B
+↓
+整个计划完成
+↓
+保存最后完成任务
+↓
+启动预测计时器
+↓
+查询长期记忆
+↓
+询问或生成预测任务
+
+预测任务不能直接调用 agent.execute_task()，仍然必须经过：
+
+生成单步骤计划
+→ compile_plan()
+→ 服务检查
+→ run_plan()
+→ agent.execute_task()
+
+6. 核心函数
+
+normalize_task(task)
+add_connection(previous, next_task)
+get_candidates(previous)
+confirm_connection(previous, next_task)
+delete_connection(previous, next_task)
+replace_connection(previous, old_next, new_next)
+decide_next(previous)
+
+7. 安全执行原则
+
+所有预测出的动作必须重新进入正式编排、编译和执行链路，不允许绕过 compile_plan、服务检查和 run_plan 直接操作机器人。

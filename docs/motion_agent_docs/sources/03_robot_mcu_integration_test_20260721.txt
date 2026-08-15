@@ -1,0 +1,511 @@
+
+1. 测试信息
+
+- 测试日期：2026-07-21
+- 机器人：sunrise@192.168.31.37
+- ROS 2：Humble
+- ROS_DOMAIN_ID：37
+- Agent 目录：/home/sunrise/jqr_deploy/JQR_20260720/agent
+- Base 工作空间：/home/sunrise/jqr_deploy/JQR_20260720/base_ws
+- 模拟交互端：/home/sunrise/jqr_deploy/JQR_20260720/tools/manual_agent_mcu_aux_client.py
+- Agent WebSocket：ws://127.0.0.1:8766
+- MCU USB CDC：/dev/ttyACM0
+- 灯光测试环境：白天，ambient=0 (DAY)
+
+2. 本次测试链路
+模拟交互系统
+→ Motion Agent WebSocket（127.0.0.1:8766）
+→ smart_robot_agent.py
+→ ROS 2 Service
+→ jqr_base_node
+→ JQR USB SDK
+→ USB CDC（/dev/ttyACM0）
+→ MCU
+→ 实体状态灯/药箱
+→ MCU状态回读
+→ Agent返回模拟交互系统
+
+Agent 启动结果：
+Starting Smart Robot Agent, log: /home/sunrise/jqr_deploy/JQR_20260720/agent/logs/agent/agent_20260721_103651.log
+Agent started, PID: 49070
+49070 python3 smart_robot_agent.py
+LISTEN 0 100 127.0.0.1:8766 0.0.0.0:* users:(("python3",pid=49070,fd=22))
+Agent 进程正常运行，WebSocket 已在本机 8766 端口监听，可以接收交互系统请求。
+
+3. Agent 与 MCU 返回
+Agent 内部会读取 Base/MCU 的详细响应，但当前 WebSocket 服务对交互系统只保留：
+{
+  "success": true,
+  "error_msg": "",
+  "type": "任务类型"
+}
+因此本文对每项测试分别记录：
+1. 本次模拟交互系统发送给 Agent 的 JSON；
+2. 本次 Agent 返回给模拟交互系统的 JSON；
+3. Agent 转换后提交给 Base/MCU 的关键数值；
+4. 此前 Base 直连 MCU 测试中相同场景的详细回读；
+5. 本次 Agent 测试后实际查询到的 MCU 状态（存在该记录时）。
+
+4. 状态灯查询：Agent成功读取MCU灯光状态（测试通过）
+Agent输入
+{
+  "type": "get_status_light_state",
+  "params": {}
+}
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "get_status_light_state"
+}
+MCU查询含义
+Agent 调用 /get_status_light_state，读取 MCU 的 valid、control_mode、scene、ambient、effect、flags、last_command_seq 和 RGBW 输出快照。success=true 表明 Agent 得到了有效 MCU 灯光状态。
+
+5. 待机状态指示灯：暖白色、低亮度、慢呼吸（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "waiting",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=1 (WAITING)
+ambient=0 (DAY)
+restart_pattern=true
+Agent 调用 /set_status_light_scene，收到 ACK 后继续调用 /get_status_light_state，核对控制模式、场景和昼夜配置。
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=1(WAITING) ambient=0 effect=3(BREATHE) seq=144 flags=0x03 rgbw=[0,0,0,946]
+结果说明：场景控制有效，白色通道输出，效果为呼吸。产品定义为暖白色、低亮度、约 6 秒一个呼吸周期。
+
+6. 工作状态指示灯：绿色、中亮度、常亮（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "working",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换的MCU输入
+scene=2 (WORKING)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=2(WORKING) ambient=0 effect=1(STEADY) seq=209 flags=0x03 rgbw=[0,897,0,0]
+结果说明：绿色通道输出，灯效为常亮，对应白天工作状态。
+
+7. 紧急安全告警指示灯：红色、高亮度、快速闪烁（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "safety_alert",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=3 (SAFETY_ALERT)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=3(SAFETY_ALERT) ambient=0 effect=2(BLINK) seq=54 flags=0x03 rgbw=[1000,0,0,0]
+结果说明：红色通道满输出，效果为闪烁。产品定义为高亮红色、约 0.5 秒一个闪烁周期。
+
+8. 故障状态指示灯：红色、高亮度、常亮（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "fault",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=4 (FAULT)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=4(FAULT) ambient=0 effect=1(STEADY) seq=122 flags=0x03 rgbw=[1000,0,0,0]
+结果说明：红色通道满输出，效果为常亮，对应故障状态。
+
+9. 急停状态指示灯：红色、高亮度、常亮（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "estop",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=5 (ESTOP)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=5(ESTOP) ambient=0 effect=1(STEADY) seq=199 flags=0x03 rgbw=[1000,0,0,0]
+结果说明：红色通道满输出，效果为常亮。FAULT 与 ESTOP 的视觉定义相同
+
+10. 常规低电状态指示灯：黄色、中亮度、慢闪（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "low_battery",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=6 (LOW_BATTERY)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=6(LOW_BATTERY) ambient=0 effect=2(BLINK) seq=41 flags=0x03 rgbw=[950,850,0,0]
+结果说明：红、绿通道组合为黄色，效果为闪烁。产品定义为约 2 秒一个闪烁周期。
+
+11. 深度低电状态指示灯：黄色、中亮度、较快闪烁（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "critical_battery",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=7 (CRITICAL_BATTERY)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=7(CRITICAL_BATTERY) ambient=0 effect=2(BLINK) seq=111 flags=0x03 rgbw=[950,850,0,0]
+结果说明：红、绿通道组合为黄色，效果为闪烁。产品定义为约 1 秒一个闪烁周期，比常规低电更快。
+
+12. 充电状态指示灯：绿色、低亮度、呼吸（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "charging",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=8 (CHARGING)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=8(CHARGING) ambient=0 effect=3(BREATHE) seq=124 flags=0x03 rgbw=[0,765,0,0]
+结果说明：绿色通道输出，效果为呼吸。产品定义为低亮度、约 2 秒一个呼吸周期。
+
+13. 升级状态指示灯：蓝色、中亮度、呼吸（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "upgrading",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=9 (UPGRADING)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=9(UPGRADING) ambient=0 effect=3(BREATHE) seq=161 flags=0x03 rgbw=[0,0,808,0]
+结果说明：蓝色通道输出，效果为呼吸。产品定义为约 2 秒一个呼吸周期。
+
+14. 配对状态指示灯：蓝色、中亮度、闪烁（测试通过）
+[图片]
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "pairing",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=10 (PAIRING)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=10(PAIRING) ambient=0 effect=2(BLINK) seq=198 flags=0x03 rgbw=[0,0,950,0]
+结果说明：蓝色通道输出，效果为闪烁。产品定义为约 2 秒一个闪烁周期。
+
+15. 关闭状态指示灯：所有颜色通道关闭（测试通过）
+Agent输入
+{
+  "type": "set_status_light_scene",
+  "params": {
+    "scene": "off",
+    "ambient": "day",
+    "restart_pattern": true,
+    "verify": true,
+    "timeout": 3.0
+  }
+}
+Agent转换后的MCU输入
+scene=0 (OFF)
+ambient=0 (DAY)
+restart_pattern=true
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_status_light_scene"
+}
+MCU回读
+light: valid=True mode=2 scene=0(OFF) ambient=0 effect=0(OFF) seq=184 flags=0x03 rgbw=[0,0,0,0]
+结果说明：本次 Agent 下发 OFF 后，MCU 实际回读为 OFF，RGBW 四个通道全部为 0，实体状态灯关闭。
+
+16. 药箱状态查询：Agent成功读取药箱状态（测试通过）
+Agent输入
+{
+  "type": "get_medicine_box_status",
+  "params": {}
+}
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "get_medicine_box_status"
+}
+动作前MCU实际状态
+medicine: valid=True state=2(CLOSED) target=2 source=2 seq=152 fault=0x0000 result=1 current=-111mA angle_raw=2263 io=0x0d
+结果说明：药箱状态有效，初始为完全关闭，无故障，可以进行打开测试。
+
+17. 药箱打开动作：Agent控制药箱到达完全打开（测试通过）
+暂时无法在i讯飞文档外展示此内容
+Agent输入
+{
+  "type": "set_medicine_box_command",
+  "params": {
+    "command": "open",
+    "wait": true,
+    "timeout": 12.0,
+    "poll_interval": 0.1
+  }
+}
+Agent转换后的MCU输入
+command=1 (OPEN)
+Agent 收到 MCU ACK 后没有立即返回，而是持续查询 /get_medicine_box_status，并检查：
+command_source=2 (HOST)
+last_command_seq=本次ACK的command_seq
+target_command=1 (OPEN)
+最终state=4 (OPEN)
+state不为7 (FAULT)
+fault_flags=0
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_medicine_box_command"
+}
+本次Agent打开后的MCU实际回读
+medicine: valid=True state=4(OPEN) target=1 source=2 seq=119 fault=0x0000 result=1 current=-95mA angle_raw=10698 io=0x0c
+结果说明：本次动作的目标为 OPEN，来源为 HOST，命令序号为 119，最终到达完全打开状态，动作结果为成功，故障位为 0。
+此前Base直连MCU打开测试的状态过程
+medicine ACK: accepted=True seq=241 message=Medicine box command acknowledged by MCU
+medicine: valid=True state=3(OPENING) target=1 source=2 seq=241 fault=0x0000 result=0 current=70mA angle_raw=685 io=0x0d
+medicine: valid=True state=3(OPENING) target=1 source=2 seq=241 fault=0x0000 result=0 current=536mA angle_raw=7636 io=0x0c
+medicine: valid=True state=4(OPEN) target=1 source=2 seq=241 fault=0x0000 result=1 current=122mA angle_raw=8434 io=0x0c
+[PASS] matching MCU completion status received
+此前直测与本次 Agent 测试均证明药箱能够从 CLOSED 经 OPENING 到达 OPEN。
+
+18. 药箱关闭动作：Agent控制药箱回到完全关闭（测试通过）
+暂时无法在i讯飞文档外展示此内容
+Agent输入
+{
+  "type": "set_medicine_box_command",
+  "params": {
+    "command": "close",
+    "wait": true,
+    "timeout": 12.0,
+    "poll_interval": 0.1
+  }
+}
+Agent转换后的MCU输入
+command=2 (CLOSE)
+Agent 收到 MCU ACK 后持续查询状态，并检查：
+command_source=2 (HOST)
+last_command_seq=本次ACK的command_seq
+target_command=2 (CLOSE)
+最终state=2 (CLOSED)
+state不为7 (FAULT)
+fault_flags=0
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "set_medicine_box_command"
+}
+本次Agent关闭后的MCU实际回读
+medicine: valid=True state=2(CLOSED) target=2 source=2 seq=185 fault=0x0000 result=1 current=36mA angle_raw=2215 io=0x0d
+结果说明：本次动作的目标为 CLOSE，来源为 HOST，命令序号为 185，最终回到完全关闭状态，动作结果为成功，故障位为 0。
+此前Base直连MCU关闭测试的状态过程
+medicine ACK: accepted=True seq=152 message=Medicine box command acknowledged by MCU
+medicine: valid=True state=5(CLOSING) target=2 source=2 seq=152 fault=0x0000 result=0 current=256mA angle_raw=10953 io=0x0c
+medicine: valid=True state=5(CLOSING) target=2 source=2 seq=152 fault=0x0000 result=0 current=450mA angle_raw=173 io=0x0c
+medicine: valid=True state=2(CLOSED) target=2 source=2 seq=152 fault=0x0000 result=1 current=-92mA angle_raw=2263 io=0x0d
+[PASS] matching MCU completion status received
+此前直测与本次 Agent 测试均证明药箱能够从 OPEN 经 CLOSING 回到 CLOSED。
+
+19. 清除全部故障：Agent发送0xFFFFFFFF掩码（测试通过）
+Agent输入
+{
+  "type": "clear_fault",
+  "params": {
+    "fault_mask": 4294967295
+  }
+}
+Agent转换后的MCU输入
+fault_mask=0xFFFFFFFF
+Agent 调用 /clear_fault，只有 Base 返回的 result_number 等于 1 时，Agent 才会向交互系统返回成功。
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "clear_fault"
+}
+结果说明：Agent 正确接收十进制 4294967295，将其作为 uint32 全故障掩码提交给 Base，MCU 对本次请求返回成功。
+
+20. 清除指定故障位：Agent发送bit0和bit2掩码（测试通过）
+Agent输入
+{
+  "type": "clear_fault",
+  "params": {
+    "fault_mask": 5
+  }
+}
+Agent转换后的MCU输入
+fault_mask=5
+二进制低位=0b0101
+请求清除bit0和bit2
+Agent输出
+{
+  "success": true,
+  "error_msg": "",
+  "type": "clear_fault"
+}
+两次清除请求后的MCU状态快照
+medicine: valid=True state=2(CLOSED) target=2 source=2 seq=185 fault=0x0000 result=1 current=247mA angle_raw=2215 io=0x0d
+light: valid=True mode=2 scene=0(OFF) ambient=0 effect=0(OFF) seq=184 flags=0x03 rgbw=[0,0,0,0]
+[PASS] medicine-box and status-light reports are valid
+结果说明：两种故障掩码均成功经过 Agent、Base、SDK 发送给 MCU。测试前药箱故障位已经为 0，因此本次证明的是故障清除命令链路和 MCU 成功响应，不能据此证明某个真实物理故障已经被清除。
+
+21. 测试总结
+本次 Agent 真机测试已经完成：
+6. Agent 正常启动并监听 WebSocket；
+7. Agent 能够查询 MCU 状态灯状态；
+8. Agent 能够设置全部十种业务灯光场景和 OFF；
+9. 每次灯光请求均启用 verify=true，Agent 在返回成功前完成 MCU 场景回读检查；
+10. 本次最终 OFF 场景得到 MCU 实际回读，RGBW 全部为 0；
+11. Agent 能够查询药箱状态；
+12. Agent 成功控制药箱打开并等待到位；
+13. Agent 成功控制药箱关闭并等待到位；
+14. 药箱动作的目标、来源、命令序号、最终状态、结果和故障位符合文档要求；
+15. Agent 成功发送 0xFFFFFFFF 全故障清除掩码；
+16. Agent 成功发送数值 5，即 bit0 和 bit2 的指定故障清除掩码；
+17. 此前 Base 直连 MCU 测试与本次 Agent 测试结果相互对应，完整链路工作正常。
+
+

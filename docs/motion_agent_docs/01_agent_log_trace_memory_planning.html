@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent日志、Trace、Memory与Planning</title>
+  <link rel="stylesheet" href="assets/document.css">
+</head>
+<body>
+  <header class="topbar">
+    <strong>01 · Agent日志与长期演进</strong>
+    <nav><a href="index.html">文档首页</a><a href="02_complex_task_orchestration.html">下一篇</a></nav>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">ORIGINAL DOCUMENT · 807 LINES</div>
+      <h1>7月15日找人找物主线与Agent能力演进</h1>
+      <p>保留日志易读化、Trace评分、AgentMemory、Agent Planning、RL数据与Skills沉淀的原始讨论。</p>
+    </section>
+
+    <figure class="figure">
+      <img src="assets/agent_system_architecture.png" alt="Motion Agent任务路由总体架构图">
+      <figcaption>原图：输入入口、LLM/JSON解析、任务路由、执行通道与结果回传</figcaption>
+    </figure>
+    <figure class="figure">
+      <img src="assets/find_person_sequence.png" alt="找人任务端到端时序图">
+      <figcaption>原图：测试脚本、Motion Agent、VLN、ROS2数据源与运动系统的找人链路</figcaption>
+    </figure>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <h2>原文章节</h2>
+        <div id="toc" class="toc"></div>
+      </aside>
+      <article class="paper">
+        <div class="toolbar">
+          <button id="toggle-view">查看完整原文</button>
+          <button id="copy-source">复制原文</button>
+          <input id="search-source" type="search" placeholder="筛选原文行">
+          <a class="button" href="sources/01_agent_log_trace_memory_planning.txt">打开原始文本</a>
+        </div>
+        <div id="load-status" class="status">正在载入原文…</div>
+        <section id="document-content"></section>
+        <pre id="raw-content" class="raw-source hidden"></pre>
+      </article>
+    </div>
+  </main>
+  <script>window.DOC_CONFIG = { source: "sources/01_agent_log_trace_memory_planning.txt" };</script>
+  <script src="assets/document-viewer.js"></script>
+</body>
+</html>

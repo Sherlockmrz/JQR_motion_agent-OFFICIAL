@@ -1,0 +1,76 @@
+开发计划
+
+暂时无法在 i 讯飞文档外展示此内容
+
+1. 交互软件
+
+1. 完成 kinbot-agent LangGraph 方案开发，串通表情、运动控制。（已完成）
+2. 完成 Agentic System 方案 Demo 初版开发，支持语音交互。
+
+任务链接：
+https://applink.xfchat.iflytek.com/client/todo/task_list?guid=2add2a78-5423-4c76-8477-74284793db7f
+
+代码仓库、编译、调试 SOP：
+家庭机器人 kinbot agent 编译部署 SOP
+
+开发工作流：
+
+git checkout main && git pull                 # 同步主干
+git checkout -b feature/lcj-xxx               # 切分支
+# 开发提交
+git fetch origin && git rebase origin/main    # 定期 rebase 避免冲突
+git push origin feature/lcj-xxx               # 推送
+# 提 PR/MR，Code Review 通过后合并
+git branch -d feature/lcj-xxx                 # 合并后删除
+
+开发规范：
+
+1. 禁止直接 push 到 main。
+2. 合并前 rebase。
+
+目标架构：
+https://yf2ljykclb.xfchat.iflytek.com/sync/SC8CdWuPysaBtIbfS01rYRtBzEf
+
+当前架构图：
+暂时无法在 i 讯飞文档外展示此内容
+
+重点开发模块能力
+
+序号：1
+功能：Agent 方案；路由、派发；Agent runtime；性能优化
+负责人：@李昶锦 cjli13
+
+序号：2
+功能：医疗能力；智能药箱用药管理；医疗能力接入
+负责人：@彭城 chengpeng11
+
+序号：3
+功能：能力服务；表情 WS；运动 WS；声学前端；语音合成；声纹、人脸
+负责人：@李晓姣 xjli45
+
+序号：4
+功能：会话管理；MemoryManager；记忆管理；空间记忆；人设管理
+负责人：@潘奎宇 kypan2
+
+序号：5
+功能：事件触发；定时；外部下发；传感器；TUI 模拟
+负责人：@彭城 chengpeng11
+
+序号：6
+功能：TUI 优化与维护
+负责人：原文未标明
+
+[图片：Kinbot L1 基础业务 Agent 与 Skill 跨空间互连视图]
+
+[图片：Agentic System 语音、事件、视频输入及 Agent 调度流程]
+
+[图片：Kinbot Rust Agent Console 与命令帮助界面]
+
+代办与结论
+
+1. 每个 Agent 的输入和输出定义：工具调用、意图等。@李昶锦 cjli13
+2. Agent 具有哪些功能：播音乐、查天气。@李昶锦 cjli13
+3. 9 月底进入家庭目标下的功能需求。@李昶锦 cjli13
+4. 记忆能力按当前通用模型执行，后续待模型训练完成后更新。会话内记忆由云端模型承担（@吴奎 kuiwu），长期等个性化记忆由端侧生产（@潘奎宇 kypan2），云端模型消费。
+5. 当前医疗 27B 仅有问答能力，交互和泛化能力不足。需要根据用药流程（@彭城 chengpeng11）和问诊流程生产交互数据进行训练。@吴奎 kuiwu
+6. 输出对 27B 模型的需求和指标：交互效果、医疗问答准确性、特定场景问答能力。@聂博文 bwnie @李昶锦 cjli13

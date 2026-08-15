@@ -1,0 +1,6 @@
+# Preserve the three supplied source documents byte-for-byte, including their
+# original line endings. They are archival inputs, not normalized source code.
+sources/*.txt -text
+
+# Flowcharts are original binary attachments.
+assets/*.png binary
